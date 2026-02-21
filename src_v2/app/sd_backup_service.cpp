@@ -1,12 +1,15 @@
 #include "app/sd_backup_service.h"
 
 #include <Arduino.h>
-#include <SD.h>
+#include <SdFat.h>
 #include <SPI.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
+#include <ctime>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -16,10 +19,16 @@
 namespace omote_v2 {
 
 namespace {
-constexpr const char* kBackupPath = "/omote_v2_backup.txt";
+constexpr const char* kLegacyBackupPath = "/omote_v2_backup.txt";
+constexpr const char* kBackupPrefix = "/omote_v2_backup_";
+constexpr const char* kBackupSuffix = ".txt";
+constexpr const char* kBackupIndexPath = "/omote_v2_backup_index.txt";
 constexpr const char* kHeader = "OMOTEV2_BACKUP_V1";
 constexpr size_t kMaxDevices = 24;
 constexpr size_t kMaxActivities = 12;
+constexpr size_t kMaxBackupEntries = 48;
+constexpr time_t kMinValidEpoch = 1704067200;  // 2024-01-01 00:00:00 UTC
+SdFs g_sd;
 
 std::string encode_component(const std::string& in) {
   std::string out;
@@ -256,18 +265,260 @@ void set_status(std::string* out_status, const std::string& status) {
   if (out_status != nullptr) *out_status = status;
 }
 
+bool read_line(FsFile* file, String* out) {
+  if (file == nullptr || out == nullptr) return false;
+  *out = "";
+  while (file->available()) {
+    int c = file->read();
+    if (c < 0) break;
+    if (c == '\r') continue;
+    if (c == '\n') return true;
+    out->concat(static_cast<char>(c));
+  }
+  return out->length() > 0;
+}
+
+bool sd_begin_with_fallback() {
+  if (g_sd.begin(SdSpiConfig(SD_CS_GPIO, SHARED_SPI, SD_SCK_MHZ(10), &SPI))) return true;
+  if (g_sd.begin(SdSpiConfig(SD_CS_GPIO, SHARED_SPI, SD_SCK_MHZ(4), &SPI))) return true;
+  if (g_sd.begin(SdSpiConfig(SD_CS_GPIO, SHARED_SPI, SD_SCK_MHZ(1), &SPI))) return true;
+  return false;
+}
+
 bool mount_sd(std::string* out_status) {
   init_SD_HAL();
-  if (SD.begin(SD_CS_GPIO, SPI, 10000000)) return true;
+  if (sd_begin_with_fallback()) return true;
 
   // Retry once after reinitializing the SPI bus.
   SPI.end();
   delay(20);
   init_SD_HAL();
-  if (SD.begin(SD_CS_GPIO, SPI, 10000000)) return true;
+  if (sd_begin_with_fallback()) return true;
 
-  set_status(out_status, "SD mount failed. Card must be FAT/exFAT.");
+  set_status(out_status, "SD mount failed. Card must be FAT32 or exFAT.");
   return false;
+}
+
+bool is_valid_time(time_t now) {
+  return now >= kMinValidEpoch;
+}
+
+std::string build_backup_token(bool* out_has_valid_time) {
+  time_t now = time(nullptr);
+  if (is_valid_time(now)) {
+    if (out_has_valid_time != nullptr) *out_has_valid_time = true;
+    struct tm now_tm {};
+    localtime_r(&now, &now_tm);
+    char stamp[20];
+    strftime(stamp, sizeof(stamp), "%Y%m%d_%H%M%S", &now_tm);
+    return stamp;
+  }
+  if (out_has_valid_time != nullptr) *out_has_valid_time = false;
+  char stamp[24];
+  snprintf(stamp, sizeof(stamp), "unsynced_%010lu", static_cast<unsigned long>(millis()));
+  return stamp;
+}
+
+std::string build_backup_path_from_token(const std::string& token) {
+  return std::string(kBackupPrefix) + token + kBackupSuffix;
+}
+
+bool is_structured_backup_path(const std::string& path) {
+  const std::string prefix = kBackupPrefix;
+  const std::string suffix = kBackupSuffix;
+  return path.size() > prefix.size() + suffix.size() &&
+         path.rfind(prefix, 0) == 0 &&
+         path.compare(path.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+std::string backup_label_from_path(const std::string& path) {
+  if (path == kLegacyBackupPath) return "Legacy backup";
+  if (!is_structured_backup_path(path)) return path;
+
+  const std::string prefix = kBackupPrefix;
+  const std::string suffix = kBackupSuffix;
+  const std::string token = path.substr(prefix.size(), path.size() - prefix.size() - suffix.size());
+
+  if (token.rfind("unsynced_", 0) == 0) {
+    return "Unsynced " + token.substr(strlen("unsynced_"));
+  }
+
+  if (token.size() == 15 && token[8] == '_') {
+    bool valid = true;
+    for (size_t i = 0; i < token.size(); ++i) {
+      if (i == 8) continue;
+      if (token[i] < '0' || token[i] > '9') {
+        valid = false;
+        break;
+      }
+    }
+    if (valid) {
+      std::string pretty;
+      pretty.reserve(19);
+      pretty.append(token.substr(0, 4));
+      pretty.push_back('-');
+      pretty.append(token.substr(4, 2));
+      pretty.push_back('-');
+      pretty.append(token.substr(6, 2));
+      pretty.push_back(' ');
+      pretty.append(token.substr(9, 2));
+      pretty.push_back(':');
+      pretty.append(token.substr(11, 2));
+      pretty.push_back(':');
+      pretty.append(token.substr(13, 2));
+      return pretty;
+    }
+  }
+  return token;
+}
+
+bool path_exists(const std::string& path) {
+  if (path.empty()) return false;
+  return g_sd.exists(path.c_str());
+}
+
+std::vector<std::string> load_backup_index() {
+  std::vector<std::string> entries;
+  FsFile index = g_sd.open(kBackupIndexPath, O_RDONLY);
+  if (!index) return entries;
+
+  String line;
+  while (read_line(&index, &line)) {
+    line.trim();
+    if (line.isEmpty()) continue;
+    std::string entry = line.c_str();
+    if (entry.empty()) continue;
+    if (std::find(entries.begin(), entries.end(), entry) != entries.end()) continue;
+    entries.push_back(entry);
+    if (entries.size() >= kMaxBackupEntries) break;
+  }
+  index.close();
+  return entries;
+}
+
+bool save_backup_index(const std::vector<std::string>& entries) {
+  FsFile index = g_sd.open(kBackupIndexPath, O_WRONLY | O_CREAT | O_TRUNC);
+  if (!index) return false;
+  for (const std::string& entry : entries) {
+    if (entry.empty()) continue;
+    index.println(entry.c_str());
+  }
+  index.close();
+  return true;
+}
+
+void prepend_backup_index(std::vector<std::string>* entries, const std::string& path) {
+  if (entries == nullptr || path.empty()) return;
+  auto existing = std::find(entries->begin(), entries->end(), path);
+  if (existing != entries->end()) {
+    entries->erase(existing);
+  }
+  entries->insert(entries->begin(), path);
+  if (entries->size() > kMaxBackupEntries) {
+    entries->resize(kMaxBackupEntries);
+  }
+}
+
+bool parse_backup_file(const std::string& backup_path, std::vector<DeviceRecord>* out_devices, std::vector<ActivityRecord>* out_activities,
+                       std::string* out_status) {
+  FsFile file = g_sd.open(backup_path.c_str(), O_RDONLY);
+  if (!file) {
+    set_status(out_status, "SD restore failed: backup missing");
+    return false;
+  }
+
+  String line;
+  if (!read_line(&file, &line)) {
+    file.close();
+    set_status(out_status, "SD restore failed: bad header");
+    return false;
+  }
+  line.trim();
+  if (line != kHeader) {
+    file.close();
+    set_status(out_status, "SD restore failed: bad header");
+    return false;
+  }
+
+  if (!read_line(&file, &line)) {
+    file.close();
+    set_status(out_status, "SD restore failed: invalid device count");
+    return false;
+  }
+  line.trim();
+  uint32_t expected_devices = 0;
+  if (!parse_count_line(std::string(line.c_str()), "DEVICES ", &expected_devices) || expected_devices > kMaxDevices) {
+    file.close();
+    set_status(out_status, "SD restore failed: invalid device count");
+    return false;
+  }
+
+  std::vector<DeviceRecord> devices;
+  devices.reserve(expected_devices);
+  for (uint32_t i = 0; i < expected_devices; ++i) {
+    String row;
+    if (!read_line(&file, &row)) {
+      file.close();
+      set_status(out_status, "SD restore failed: invalid device row");
+      return false;
+    }
+    row.trim();
+    DeviceRecord parsed;
+    if (!parse_device_line(std::string(row.c_str()), &parsed)) {
+      file.close();
+      set_status(out_status, "SD restore failed: invalid device row");
+      return false;
+    }
+    devices.push_back(parsed);
+  }
+
+  if (!read_line(&file, &line)) {
+    file.close();
+    set_status(out_status, "SD restore failed: invalid activity count");
+    return false;
+  }
+  line.trim();
+  uint32_t expected_activities = 0;
+  if (!parse_count_line(std::string(line.c_str()), "ACTIVITIES ", &expected_activities) || expected_activities > kMaxActivities) {
+    file.close();
+    set_status(out_status, "SD restore failed: invalid activity count");
+    return false;
+  }
+
+  std::vector<ActivityRecord> activities;
+  activities.reserve(expected_activities);
+  for (uint32_t i = 0; i < expected_activities; ++i) {
+    String row;
+    if (!read_line(&file, &row)) {
+      file.close();
+      set_status(out_status, "SD restore failed: invalid activity row");
+      return false;
+    }
+    row.trim();
+    ActivityRecord parsed;
+    if (!parse_activity_line(std::string(row.c_str()), &parsed)) {
+      file.close();
+      set_status(out_status, "SD restore failed: invalid activity row");
+      return false;
+    }
+    activities.push_back(parsed);
+  }
+
+  if (!read_line(&file, &line)) {
+    file.close();
+    set_status(out_status, "SD restore failed: missing end marker");
+    return false;
+  }
+  line.trim();
+  file.close();
+  if (line != "END") {
+    set_status(out_status, "SD restore failed: missing end marker");
+    return false;
+  }
+
+  *out_devices = std::move(devices);
+  *out_activities = std::move(activities);
+  return true;
 }
 }  // namespace
 
@@ -284,8 +535,9 @@ bool SdBackupService::backup_to_sd(const std::vector<DeviceRecord>& devices, con
     return false;
   }
 
-  SD.remove(kBackupPath);
-  File file = SD.open(kBackupPath, FILE_WRITE);
+  bool has_valid_time = false;
+  const std::string backup_path = build_backup_path_from_token(build_backup_token(&has_valid_time));
+  FsFile file = g_sd.open(backup_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC);
   if (!file) {
     set_status(out_status, "SD backup failed: open write");
     return false;
@@ -305,13 +557,72 @@ bool SdBackupService::backup_to_sd(const std::vector<DeviceRecord>& devices, con
   file.println("END");
   file.close();
 
-  set_status(out_status, "SD backup saved: /omote_v2_backup.txt");
+  std::vector<std::string> index = load_backup_index();
+  prepend_backup_index(&index, backup_path);
+  const bool index_saved = save_backup_index(index);
+
+  if (has_valid_time) {
+    if (index_saved) {
+      set_status(out_status, "SD backup saved: " + backup_path);
+    } else {
+      set_status(out_status, "SD backup saved, index update failed");
+    }
+  } else {
+    if (index_saved) {
+      set_status(out_status, "SD backup saved with unsynced time. Connect WiFi or set time manually for dated backups.");
+    } else {
+      set_status(out_status, "SD backup saved with unsynced time; index update failed");
+    }
+  }
   return true;
 }
 
-bool SdBackupService::restore_from_sd(std::vector<DeviceRecord>* out_devices, std::vector<ActivityRecord>* out_activities, std::string* out_status) const {
+bool SdBackupService::list_backups(std::vector<SdBackupEntry>* out_backups, std::string* out_status) const {
+  if (out_backups == nullptr) {
+    set_status(out_status, "SD list failed: invalid output");
+    return false;
+  }
+  out_backups->clear();
+
+  if (!mount_sd(out_status)) {
+    if (out_status != nullptr && out_status->empty()) {
+      set_status(out_status, "SD list failed: card init");
+    }
+    return false;
+  }
+
+  std::vector<std::string> index = load_backup_index();
+  for (const std::string& path : index) {
+    if (!path_exists(path)) continue;
+    SdBackupEntry entry;
+    entry.path = path;
+    entry.label = backup_label_from_path(path);
+    out_backups->push_back(entry);
+  }
+
+  if (out_backups->empty() && path_exists(kLegacyBackupPath)) {
+    SdBackupEntry legacy;
+    legacy.path = kLegacyBackupPath;
+    legacy.label = backup_label_from_path(kLegacyBackupPath);
+    out_backups->push_back(legacy);
+  }
+
+  if (out_backups->empty()) {
+    set_status(out_status, "No backups found on SD");
+  } else {
+    set_status(out_status, "Backups found");
+  }
+  return true;
+}
+
+bool SdBackupService::restore_from_sd(const std::string& backup_path, std::vector<DeviceRecord>* out_devices,
+                                      std::vector<ActivityRecord>* out_activities, std::string* out_status) const {
   if (out_devices == nullptr || out_activities == nullptr) {
     set_status(out_status, "SD restore failed: invalid output");
+    return false;
+  }
+  if (backup_path.empty()) {
+    set_status(out_status, "SD restore failed: no backup selected");
     return false;
   }
 
@@ -322,102 +633,15 @@ bool SdBackupService::restore_from_sd(std::vector<DeviceRecord>* out_devices, st
     return false;
   }
 
-  File file = SD.open(kBackupPath, FILE_READ);
-  if (!file) {
-    set_status(out_status, "SD restore failed: backup missing");
-    return false;
-  }
-
-  String line = file.readStringUntil('\n');
-  line.trim();
-  if (line != kHeader) {
-    file.close();
-    set_status(out_status, "SD restore failed: bad header");
-    return false;
-  }
-
-  line = file.readStringUntil('\n');
-  line.trim();
-  uint32_t expected_devices = 0;
-  if (!parse_count_line(std::string(line.c_str()), "DEVICES ", &expected_devices) || expected_devices > kMaxDevices) {
-    file.close();
-    set_status(out_status, "SD restore failed: invalid device count");
-    return false;
-  }
-
   std::vector<DeviceRecord> devices;
-  devices.reserve(expected_devices);
-  for (uint32_t i = 0; i < expected_devices; ++i) {
-    String row = file.readStringUntil('\n');
-    row.trim();
-    DeviceRecord parsed;
-    if (!parse_device_line(std::string(row.c_str()), &parsed)) {
-      file.close();
-      set_status(out_status, "SD restore failed: invalid device row");
-      return false;
-    }
-    devices.push_back(parsed);
-  }
-
-  line = file.readStringUntil('\n');
-  line.trim();
-  uint32_t expected_activities = 0;
-  if (!parse_count_line(std::string(line.c_str()), "ACTIVITIES ", &expected_activities) || expected_activities > kMaxActivities) {
-    file.close();
-    set_status(out_status, "SD restore failed: invalid activity count");
-    return false;
-  }
-
   std::vector<ActivityRecord> activities;
-  activities.reserve(expected_activities);
-  for (uint32_t i = 0; i < expected_activities; ++i) {
-    String row = file.readStringUntil('\n');
-    row.trim();
-    ActivityRecord parsed;
-    if (!parse_activity_line(std::string(row.c_str()), &parsed)) {
-      file.close();
-      set_status(out_status, "SD restore failed: invalid activity row");
-      return false;
-    }
-    activities.push_back(parsed);
-  }
-
-  line = file.readStringUntil('\n');
-  line.trim();
-  file.close();
-  if (line != "END") {
-    set_status(out_status, "SD restore failed: missing end marker");
+  if (!parse_backup_file(backup_path, &devices, &activities, out_status)) {
     return false;
   }
 
-  *out_devices = devices;
-  *out_activities = activities;
-  set_status(out_status, "SD restore complete");
-  return true;
-}
-
-bool SdBackupService::format_sd_card(std::string* out_status) const {
-  if (!mount_sd(out_status)) {
-    if (out_status != nullptr && out_status->empty()) {
-      set_status(out_status, "SD format failed: card init");
-    }
-    return false;
-  }
-
-  SD.remove(kBackupPath);
-  File file = SD.open(kBackupPath, FILE_WRITE);
-  if (!file) {
-    set_status(out_status, "SD format failed: open write");
-    return false;
-  }
-
-  file.println(kHeader);
-  file.println("DEVICES 0");
-  file.println("ACTIVITIES 0");
-  file.println("END");
-  file.close();
-
-  set_status(out_status, "SD quick format complete");
+  *out_devices = std::move(devices);
+  *out_activities = std::move(activities);
+  set_status(out_status, "SD restore complete: " + backup_label_from_path(backup_path));
   return true;
 }
 

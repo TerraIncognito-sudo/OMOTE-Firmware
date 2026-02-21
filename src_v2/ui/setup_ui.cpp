@@ -1,15 +1,23 @@
 #include "ui/setup_ui.h"
 
 #include <Arduino.h>
+#include <algorithm>
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
+#include <ctime>
 #include <stdio.h>
+#include <sys/time.h>
 
 #include <list>
+#include <map>
 #include <sstream>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
+
+#include <Preferences.h>
 
 #include "hardwareLayer.h"
 #include "app/device_model.h"
@@ -20,8 +28,60 @@ namespace {
 const char* kTransportOptions = "IR\nBLE\nMQTT\nHTTP";
 const char* kDeviceTypeOptions = "TV\nAVR\nMedia Player\nSmart Home\nLighting\nCustom";
 const char* kCommandSlotOptions = "Power\nVolume Up\nVolume Down\nMute\nUp\nDown\nLeft\nRight\nOK\nBack\nHome";
-const char* kPhysicalKeyOptions = "Power(o)\nBack(b)\nHome(s)\nUp(u)\nDown(d)\nLeft(l)\nRight(r)\nOK(k)\nVolUp(+)\nVolDown(-)\nMute(m)\nChannelUp(^)\nChannelDown(v)\nPlay(p)\nRewind(<)\nForward(>)";
+constexpr time_t kMinValidClockEpoch = 1704067200;  // 2024-01-01 00:00:00 UTC
+constexpr const char* kUiPrefsNs = "omotev2ui";
+constexpr const char* kUiTimezoneKey = "timezone";
+constexpr const char* kDefaultTimezoneValue = "EST5EDT,M3.2.0/2,M11.1.0/2";
 SetupUi* g_active_ui = nullptr;
+
+struct TimeZoneOption {
+  const char* label;
+  const char* value;
+};
+
+const TimeZoneOption kTimeZoneOptions[] = {
+    {"US Eastern", "EST5EDT,M3.2.0/2,M11.1.0/2"},
+    {"US Central", "CST6CDT,M3.2.0/2,M11.1.0/2"},
+    {"US Mountain", "MST7MDT,M3.2.0/2,M11.1.0/2"},
+    {"US Pacific", "PST8PDT,M3.2.0/2,M11.1.0/2"},
+    {"UTC", "UTC0"},
+};
+
+constexpr size_t kTimeZoneOptionCount = sizeof(kTimeZoneOptions) / sizeof(kTimeZoneOptions[0]);
+
+struct PhysicalKeyDef {
+  const char* label;
+  char key_char;
+};
+
+const PhysicalKeyDef kPhysicalKeys[] = {
+    {"Power", 'o'},
+    {"Back", 'b'},
+    {"Home", 's'},
+    {"Up", 'u'},
+    {"Down", 'd'},
+    {"Left", 'l'},
+    {"Right", 'r'},
+    {"OK", 'k'},
+    {"VolUp", '+'},
+    {"VolDown", '-'},
+    {"Mute", 'm'},
+    {"ChannelUp", '^'},
+    {"ChannelDown", 'v'},
+    {"Play", 'p'},
+    {"Rewind", '<'},
+    {"Forward", '>'},
+    {"Info", 'i'},
+    {"Red", '1'},
+    {"Green", '2'},
+    {"Yellow", '3'},
+    {"Blue", '4'},
+    {"Help", '?'},
+    {"Stop", '='},
+    {"Record", 'e'},
+};
+
+constexpr size_t kPhysicalKeyCount = sizeof(kPhysicalKeys) / sizeof(kPhysicalKeys[0]);
 
 std::string trim_copy(const std::string& in) {
   size_t start = 0;
@@ -47,6 +107,63 @@ bool parse_u32_token(const std::string& token) {
   return errno == 0 && end_ptr != nullptr && *end_ptr == '\0';
 }
 
+std::string timezone_dropdown_options() {
+  std::string options;
+  for (size_t i = 0; i < kTimeZoneOptionCount; ++i) {
+    if (!options.empty()) options += "\n";
+    options += kTimeZoneOptions[i].label;
+  }
+  return options;
+}
+
+uint16_t timezone_index_for_value(const std::string& value) {
+  for (uint16_t i = 0; i < kTimeZoneOptionCount; ++i) {
+    if (value == kTimeZoneOptions[i].value) return i;
+  }
+  return 0;
+}
+
+const char* timezone_value_for_index(uint16_t index) {
+  if (index >= kTimeZoneOptionCount) return kTimeZoneOptions[0].value;
+  return kTimeZoneOptions[index].value;
+}
+
+const char* timezone_label_for_index(uint16_t index) {
+  if (index >= kTimeZoneOptionCount) return kTimeZoneOptions[0].label;
+  return kTimeZoneOptions[index].label;
+}
+
+void apply_timezone_setting(const std::string& timezone_value) {
+  const std::string tz = timezone_value.empty() ? std::string(kDefaultTimezoneValue) : timezone_value;
+  setenv("TZ", tz.c_str(), 1);
+  tzset();
+}
+
+std::string load_timezone_setting() {
+  Preferences prefs;
+  std::string timezone = kDefaultTimezoneValue;
+  if (prefs.begin(kUiPrefsNs, true)) {
+    String stored = prefs.getString(kUiTimezoneKey, kDefaultTimezoneValue);
+    prefs.end();
+    timezone = std::string(stored.c_str());
+  }
+  if (timezone.empty()) timezone = kDefaultTimezoneValue;
+  return timezone;
+}
+
+bool save_timezone_setting(const std::string& timezone_value) {
+  Preferences prefs;
+  if (!prefs.begin(kUiPrefsNs, false)) return false;
+  prefs.putString(kUiTimezoneKey, timezone_value.c_str());
+  prefs.end();
+  return true;
+}
+
+bool starts_with(const std::string& text, const char* prefix) {
+  if (prefix == nullptr) return false;
+  return text.rfind(prefix, 0) == 0;
+}
+
 bool is_valid_ir_payload(const std::string& raw_payload) {
   std::string payload = trim_copy(raw_payload);
   if (payload.empty()) return true;  // empty means "not mapped"
@@ -66,14 +183,60 @@ bool is_valid_ir_payload(const std::string& raw_payload) {
   return parse_u64_token(trim_copy(data)) && parse_u32_token(trim_copy(bits)) && parse_u32_token(trim_copy(repeat));
 }
 
-std::string join_protocol_options() {
-  std::string options;
-  const std::vector<int>& protocols = supported_ir_protocols();
-  for (size_t i = 0; i < protocols.size(); ++i) {
-    if (i > 0) options.append("\n");
-    options.append(protocol_name(protocols[i]));
+bool get_valid_local_time(struct tm* out_tm) {
+  if (out_tm == nullptr) return false;
+  time_t now = time(nullptr);
+  if (now < kMinValidClockEpoch) return false;
+  localtime_r(&now, out_tm);
+  return true;
+}
+
+std::string current_time_hhmm_text() {
+  struct tm now_tm {};
+  if (!get_valid_local_time(&now_tm)) return "--:--";
+  char buf[8];
+  strftime(buf, sizeof(buf), "%H:%M", &now_tm);
+  return std::string(buf);
+}
+
+std::string current_time_full_text() {
+  struct tm now_tm {};
+  if (!get_valid_local_time(&now_tm)) return "2026-01-01 12:00:00";
+  char buf[20];
+  strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &now_tm);
+  return std::string(buf);
+}
+
+bool parse_manual_datetime(const std::string& input, struct tm* out_tm) {
+  if (out_tm == nullptr) return false;
+  int year = 0;
+  int month = 0;
+  int day = 0;
+  int hour = 0;
+  int minute = 0;
+  int second = 0;
+  if (sscanf(input.c_str(), "%d-%d-%d %d:%d:%d", &year, &month, &day, &hour, &minute, &second) != 6) {
+    return false;
   }
-  return options;
+  if (year < 2024 || year > 2099 ||
+      month < 1 || month > 12 ||
+      day < 1 || day > 31 ||
+      hour < 0 || hour > 23 ||
+      minute < 0 || minute > 59 ||
+      second < 0 || second > 59) {
+    return false;
+  }
+
+  struct tm parsed {};
+  parsed.tm_year = year - 1900;
+  parsed.tm_mon = month - 1;
+  parsed.tm_mday = day;
+  parsed.tm_hour = hour;
+  parsed.tm_min = minute;
+  parsed.tm_sec = second;
+  parsed.tm_isdst = -1;
+  *out_tm = parsed;
+  return true;
 }
 
 void ir_learn_message_cb(std::string message) {
@@ -82,19 +245,19 @@ void ir_learn_message_cb(std::string message) {
   }
 }
 
-char key_char_from_option(const std::string& option) {
-  size_t l = option.find('(');
-  size_t r = option.find(')');
-  if (l == std::string::npos || r == std::string::npos || r <= l + 1) return '\0';
-  return option[l + 1];
-}
-
 }  // namespace
 
 SetupUi::SetupUi(DeviceRegistry& device_registry, ActivityRegistry& activity_registry, CommandDispatcher& dispatcher)
     : device_registry_(device_registry), activity_registry_(activity_registry), dispatcher_(dispatcher) {}
 
 void SetupUi::init() {
+  std::vector<DeviceRecord> normalized_devices = device_registry_.all();
+  std::vector<ActivityRecord> normalized_activities = activity_registry_.all();
+  if (normalize_restored_records(&normalized_devices, &normalized_activities)) {
+    (void)device_registry_.replace_all(std::move(normalized_devices));
+    (void)activity_registry_.replace_all(std::move(normalized_activities));
+  }
+
   root_ = lv_scr_act();
   lv_obj_clear_flag(root_, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_set_style_bg_color(root_, lv_color_hex(0x101010), LV_PART_MAIN);
@@ -110,8 +273,13 @@ void SetupUi::init() {
 
   wifi_status_label_ = lv_label_create(status_bar_);
   lv_obj_set_style_text_font(wifi_status_label_, &lv_font_montserrat_10, LV_PART_MAIN);
-  lv_label_set_text(wifi_status_label_, "WiFi: Off");
+  lv_label_set_text(wifi_status_label_, "WiFi");
   lv_obj_align(wifi_status_label_, LV_ALIGN_LEFT_MID, 2, 0);
+
+  time_status_label_ = lv_label_create(status_bar_);
+  lv_obj_set_style_text_font(time_status_label_, &lv_font_montserrat_10, LV_PART_MAIN);
+  lv_label_set_text(time_status_label_, "--:--");
+  lv_obj_align(time_status_label_, LV_ALIGN_CENTER, 0, 0);
 
   battery_status_label_ = lv_label_create(status_bar_);
   lv_obj_set_style_text_font(battery_status_label_, &lv_font_montserrat_10, LV_PART_MAIN);
@@ -154,11 +322,48 @@ void SetupUi::tick() {
 }
 
 void SetupUi::update_status_bar() {
+  bool wifi_connected = false;
 #if (ENABLE_WIFI_AND_MQTT == 1)
-  lv_label_set_text(wifi_status_label_, getIsWifiConnected_HAL() ? "WiFi: On" : "WiFi: Off");
-#else
-  lv_label_set_text(wifi_status_label_, "WiFi: Off");
+  wifi_connected = getIsWifiConnected_HAL();
 #endif
+  lv_label_set_text(wifi_status_label_, "WiFi");
+  lv_obj_set_style_text_color(wifi_status_label_,
+                              wifi_connected ? lv_color_hex(0x3EDC81) : lv_color_hex(0xE2574C),
+                              LV_PART_MAIN);
+  if (time_status_label_ != nullptr) {
+    const std::string time_text = current_time_hhmm_text();
+    lv_label_set_text(time_status_label_, time_text.c_str());
+  }
+
+  if (!last_wifi_connected_known_) {
+    last_wifi_connected_ = wifi_connected;
+    last_wifi_connected_known_ = true;
+  } else {
+    if (wifi_connect_attempt_active_) {
+      if (wifi_connected) {
+        wifi_connect_attempt_active_ = false;
+        if (settings_status_ != nullptr) {
+          if (wifi_connect_target_ssid_.empty()) {
+            lv_label_set_text(settings_status_, "WiFi connected");
+          } else {
+            lv_label_set_text_fmt(settings_status_, "WiFi connected: %s", wifi_connect_target_ssid_.c_str());
+          }
+        }
+      } else if (millis() - wifi_connect_attempt_started_ms_ > 20000) {
+        wifi_connect_attempt_active_ = false;
+        if (settings_status_ != nullptr) lv_label_set_text(settings_status_, "WiFi connect timeout");
+      }
+    } else if (last_wifi_connected_ && !wifi_connected) {
+      if (settings_status_ != nullptr) {
+        std::string current = lv_label_get_text(settings_status_);
+        if (current.empty() || starts_with(current, "WiFi")) {
+          lv_label_set_text(settings_status_, "WiFi disconnected");
+        }
+      }
+    }
+    last_wifi_connected_ = wifi_connected;
+  }
+
   int battery_mv = 0;
   int battery_pct = 0;
   bool battery_charging = false;
@@ -391,22 +596,30 @@ void SetupUi::build_settings_tab() {
   lv_obj_align(settings_restore_btn_, LV_ALIGN_TOP_LEFT, 0, 90);
   lv_obj_add_event_cb(settings_restore_btn_, on_settings_restore_clicked, LV_EVENT_CLICKED, this);
   lv_obj_t* restore_label = lv_label_create(settings_restore_btn_);
-  lv_label_set_text(restore_label, "Restore from SD");
+  lv_label_set_text(restore_label, "Restore from SD...");
   lv_obj_center(restore_label);
 
-  settings_format_btn_ = lv_btn_create(tab);
-  lv_obj_set_size(settings_format_btn_, SCR_WIDTH - 16, 38);
-  lv_obj_align(settings_format_btn_, LV_ALIGN_TOP_LEFT, 0, 134);
-  lv_obj_add_event_cb(settings_format_btn_, on_settings_format_clicked, LV_EVENT_CLICKED, this);
-  lv_obj_t* format_label = lv_label_create(settings_format_btn_);
-  lv_label_set_text(format_label, "Format SD (Quick)");
-  lv_obj_center(format_label);
+  settings_wifi_btn_ = lv_btn_create(tab);
+  lv_obj_set_size(settings_wifi_btn_, SCR_WIDTH - 16, 38);
+  lv_obj_align(settings_wifi_btn_, LV_ALIGN_TOP_LEFT, 0, 134);
+  lv_obj_add_event_cb(settings_wifi_btn_, on_settings_wifi_clicked, LV_EVENT_CLICKED, this);
+  lv_obj_t* wifi_label = lv_label_create(settings_wifi_btn_);
+  lv_label_set_text(wifi_label, "WiFi Settings");
+  lv_obj_center(wifi_label);
+
+  settings_set_time_btn_ = lv_btn_create(tab);
+  lv_obj_set_size(settings_set_time_btn_, SCR_WIDTH - 16, 38);
+  lv_obj_align(settings_set_time_btn_, LV_ALIGN_TOP_LEFT, 0, 178);
+  lv_obj_add_event_cb(settings_set_time_btn_, on_settings_set_time_clicked, LV_EVENT_CLICKED, this);
+  lv_obj_t* set_time_label = lv_label_create(settings_set_time_btn_);
+  lv_label_set_text(set_time_label, "Set Time");
+  lv_obj_center(set_time_label);
 
   settings_status_ = lv_label_create(tab);
   lv_label_set_text(settings_status_, "Status: idle");
   lv_obj_set_width(settings_status_, SCR_WIDTH - 16);
   lv_label_set_long_mode(settings_status_, LV_LABEL_LONG_WRAP);
-  lv_obj_align(settings_status_, LV_ALIGN_TOP_LEFT, 0, 182);
+  lv_obj_align(settings_status_, LV_ALIGN_TOP_LEFT, 0, 224);
 }
 
 void SetupUi::rebuild_device_list() {
@@ -528,8 +741,8 @@ void SetupUi::open_device_modal() {
   lv_obj_center(save_text);
 
   keyboard_ = lv_keyboard_create(root_);
-  lv_obj_set_size(keyboard_, SCR_WIDTH - 4, 128);
-  lv_obj_align(keyboard_, LV_ALIGN_BOTTOM_MID, 0, -2);
+  lv_obj_set_size(keyboard_, SCR_WIDTH, 128);
+  lv_obj_align(keyboard_, LV_ALIGN_BOTTOM_MID, 0, 0);
   lv_obj_add_flag(keyboard_, LV_OBJ_FLAG_HIDDEN);
   lv_obj_add_event_cb(keyboard_, on_keyboard_apply, LV_EVENT_READY, this);
 }
@@ -658,8 +871,8 @@ void SetupUi::open_command_modal() {
   lv_obj_align(command_learn_status_, LV_ALIGN_TOP_LEFT, 0, 226);
 
   keyboard_ = lv_keyboard_create(root_);
-  lv_obj_set_size(keyboard_, SCR_WIDTH - 4, 136);
-  lv_obj_align(keyboard_, LV_ALIGN_BOTTOM_MID, 0, -2);
+  lv_obj_set_size(keyboard_, SCR_WIDTH, 136);
+  lv_obj_align(keyboard_, LV_ALIGN_BOTTOM_MID, 0, 0);
   lv_obj_add_flag(keyboard_, LV_OBJ_FLAG_HIDDEN);
   lv_obj_add_event_cb(keyboard_, on_keyboard_apply, LV_EVENT_READY, this);
 
@@ -719,8 +932,16 @@ bool SetupUi::remove_command_modal() {
     if (it->name == command_name) {
       device->commands.erase(it);
       device_registry_.save();
+      if (!remove_command_references_from_activities(command_editor_device_id_, command_name) && settings_status_ != nullptr) {
+        lv_label_set_text(settings_status_, "Warning: failed to clean key bindings");
+      }
       refresh_command_name_dropdown();
       update_command_payload_for_selected_name();
+      rebuild_activity_list();
+      if (activity_keymap_modal_ != nullptr) {
+        refresh_activity_key_options();
+        refresh_activity_keymap_binding_hint();
+      }
       lv_label_set_text_fmt(remote_status_, "Removed command: %s", command_name.c_str());
       return true;
     }
@@ -922,8 +1143,8 @@ void SetupUi::open_rename_modal(bool rename_activity) {
   lv_obj_center(save_text);
 
   keyboard_ = lv_keyboard_create(root_);
-  lv_obj_set_size(keyboard_, SCR_WIDTH - 4, 136);
-  lv_obj_align(keyboard_, LV_ALIGN_BOTTOM_MID, 0, -2);
+  lv_obj_set_size(keyboard_, SCR_WIDTH, 136);
+  lv_obj_align(keyboard_, LV_ALIGN_BOTTOM_MID, 0, 0);
   lv_obj_add_flag(keyboard_, LV_OBJ_FLAG_HIDDEN);
   lv_obj_add_event_cb(keyboard_, on_keyboard_apply, LV_EVENT_READY, this);
 }
@@ -1090,8 +1311,8 @@ void SetupUi::open_activity_modal() {
   lv_obj_center(save_text);
 
   keyboard_ = lv_keyboard_create(root_);
-  lv_obj_set_size(keyboard_, SCR_WIDTH - 4, 126);
-  lv_obj_align(keyboard_, LV_ALIGN_BOTTOM_MID, 0, -2);
+  lv_obj_set_size(keyboard_, SCR_WIDTH, 126);
+  lv_obj_align(keyboard_, LV_ALIGN_BOTTOM_MID, 0, 0);
   lv_obj_add_flag(keyboard_, LV_OBJ_FLAG_HIDDEN);
   lv_obj_add_event_cb(keyboard_, on_keyboard_apply, LV_EVENT_READY, this);
 }
@@ -1158,7 +1379,6 @@ void SetupUi::open_activity_keymap_modal() {
   lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 6);
 
   dd_keymap_key_ = lv_dropdown_create(activity_keymap_modal_);
-  lv_dropdown_set_options(dd_keymap_key_, kPhysicalKeyOptions);
   lv_obj_set_width(dd_keymap_key_, SCR_WIDTH - 12);
   lv_obj_align(dd_keymap_key_, LV_ALIGN_TOP_LEFT, 0, 30);
   lv_obj_add_event_cb(dd_keymap_key_, on_activity_keymap_command_changed, LV_EVENT_VALUE_CHANGED, this);
@@ -1198,6 +1418,7 @@ void SetupUi::open_activity_keymap_modal() {
   lv_label_set_text(save_text, "Save Mapping");
   lv_obj_center(save_text);
 
+  refresh_activity_key_options();
   refresh_activity_keymap_device_dropdown();
   refresh_activity_keymap_command_dropdown();
   refresh_activity_keymap_binding_hint();
@@ -1220,15 +1441,14 @@ void SetupUi::save_activity_keymap_modal() {
   if (selected_activity_index_ < 0 || selected_activity_index_ >= static_cast<int>(activities.size())) return;
   if (dd_keymap_key_ == nullptr || dd_keymap_device_ == nullptr || dd_keymap_command_ == nullptr || keymap_status_label_ == nullptr) return;
 
-  char key_option[32];
   char command_buf[80];
-  lv_dropdown_get_selected_str(dd_keymap_key_, key_option, sizeof(key_option));
   lv_dropdown_get_selected_str(dd_keymap_command_, command_buf, sizeof(command_buf));
-  char key_char = key_char_from_option(key_option);
-  if (key_char == '\0') {
+  uint16_t key_idx = lv_dropdown_get_selected(dd_keymap_key_);
+  if (key_idx >= kPhysicalKeyCount) {
     lv_label_set_text(keymap_status_label_, "Invalid mapping");
     return;
   }
+  const char key_char = kPhysicalKeys[key_idx].key_char;
 
   const uint16_t selected_device_idx = lv_dropdown_get_selected(dd_keymap_device_);
   const uint32_t device_id = (selected_device_idx < keymap_device_ids_.size()) ? keymap_device_ids_[selected_device_idx] : 0;
@@ -1259,7 +1479,35 @@ void SetupUi::save_activity_keymap_modal() {
   activity_registry_.upsert(updated);
   lv_label_set_text_fmt(keymap_status_label_, "Saved: %c -> %s (%s)", key_char, command_name.c_str(), selected_device != nullptr ? selected_device->name.c_str() : "Unknown");
   rebuild_activity_list();
+  refresh_activity_key_options();
   refresh_activity_keymap_binding_hint();
+}
+
+void SetupUi::refresh_activity_key_options() {
+  if (dd_keymap_key_ == nullptr) return;
+  const std::vector<ActivityRecord>& activities = activity_registry_.all();
+  if (selected_activity_index_ < 0 || selected_activity_index_ >= static_cast<int>(activities.size())) return;
+
+  const uint16_t current = lv_dropdown_get_selected(dd_keymap_key_);
+  const ActivityRecord& activity = activities[selected_activity_index_];
+
+  std::string options;
+  for (size_t i = 0; i < kPhysicalKeyCount; ++i) {
+    bool mapped = false;
+    for (const ActivityKeyBinding& binding : activity.key_bindings) {
+      if (binding.key_char == kPhysicalKeys[i].key_char && !binding.command_name.empty()) {
+        mapped = true;
+        break;
+      }
+    }
+    if (!options.empty()) options += "\n";
+    options += kPhysicalKeys[i].label;
+    options += mapped ? "(*)" : "(none)";
+  }
+  lv_dropdown_set_options(dd_keymap_key_, options.c_str());
+  if (current < kPhysicalKeyCount) {
+    lv_dropdown_set_selected(dd_keymap_key_, current);
+  }
 }
 
 void SetupUi::refresh_activity_keymap_device_dropdown() {
@@ -1310,13 +1558,12 @@ void SetupUi::refresh_activity_keymap_binding_hint() {
     return;
   }
 
-  char key_option[32];
-  lv_dropdown_get_selected_str(dd_keymap_key_, key_option, sizeof(key_option));
-  char key_char = key_char_from_option(key_option);
-  if (key_char == '\0') {
+  uint16_t key_idx = lv_dropdown_get_selected(dd_keymap_key_);
+  if (key_idx >= kPhysicalKeyCount) {
     lv_label_set_text(keymap_slot_hint_label_, "");
     return;
   }
+  const char key_char = kPhysicalKeys[key_idx].key_char;
   const ActivityRecord& activity = activities[selected_activity_index_];
   for (const ActivityKeyBinding& binding : activity.key_bindings) {
     if (binding.key_char != key_char) continue;
@@ -1327,7 +1574,7 @@ void SetupUi::refresh_activity_keymap_binding_hint() {
                           device != nullptr ? device->name.c_str() : "Unknown device");
     return;
   }
-  lv_label_set_text_fmt(keymap_slot_hint_label_, "Current mapping: %c -> none", key_char);
+  lv_label_set_text(keymap_slot_hint_label_, "Current mapping: none");
 }
 
 void SetupUi::open_activity_builder_modal() {
@@ -1508,14 +1755,90 @@ void SetupUi::perform_sd_backup() {
   if (settings_status_ != nullptr) lv_label_set_text(settings_status_, status.empty() ? "SD backup failed" : status.c_str());
 }
 
+void SetupUi::open_sd_restore_modal() {
+  if (restore_modal_ != nullptr) return;
+
+  std::vector<SdBackupEntry> backups;
+  std::string status;
+  if (!sd_backup_.list_backups(&backups, &status)) {
+    if (settings_status_ != nullptr) lv_label_set_text(settings_status_, status.empty() ? "SD backup list failed" : status.c_str());
+    return;
+  }
+  if (backups.empty()) {
+    if (settings_status_ != nullptr) lv_label_set_text(settings_status_, "No backups available on SD");
+    return;
+  }
+
+  restore_backup_paths_.clear();
+  std::string options;
+  for (size_t i = 0; i < backups.size(); ++i) {
+    if (!options.empty()) options += "\n";
+    options += backups[i].label;
+    restore_backup_paths_.push_back(backups[i].path);
+  }
+
+  restore_modal_ = lv_obj_create(root_);
+  lv_obj_set_size(restore_modal_, SCR_WIDTH - 12, 172);
+  lv_obj_center(restore_modal_);
+  lv_obj_set_style_bg_color(restore_modal_, lv_color_hex(0x202020), LV_PART_MAIN);
+  lv_obj_set_style_pad_all(restore_modal_, 6, LV_PART_MAIN);
+
+  lv_obj_t* title = lv_label_create(restore_modal_);
+  lv_label_set_text(title, "Restore Backup");
+  lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 0);
+
+  dd_restore_backup_ = lv_dropdown_create(restore_modal_);
+  lv_obj_set_width(dd_restore_backup_, SCR_WIDTH - 28);
+  lv_dropdown_set_options(dd_restore_backup_, options.c_str());
+  lv_obj_align(dd_restore_backup_, LV_ALIGN_TOP_LEFT, 0, 22);
+
+  lv_obj_t* hint = lv_label_create(restore_modal_);
+  lv_label_set_text(hint, "Choose backup, then Restore.");
+  lv_obj_align(hint, LV_ALIGN_TOP_LEFT, 0, 62);
+
+  lv_obj_t* close_btn = lv_btn_create(restore_modal_);
+  lv_obj_set_size(close_btn, (SCR_WIDTH - 34) / 2, 32);
+  lv_obj_align(close_btn, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+  lv_obj_add_event_cb(close_btn, on_settings_restore_modal_close, LV_EVENT_CLICKED, this);
+  lv_obj_t* close_text = lv_label_create(close_btn);
+  lv_label_set_text(close_text, "Close");
+  lv_obj_center(close_text);
+
+  lv_obj_t* restore_btn = lv_btn_create(restore_modal_);
+  lv_obj_set_size(restore_btn, (SCR_WIDTH - 34) / 2, 32);
+  lv_obj_align(restore_btn, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
+  lv_obj_add_event_cb(restore_btn, on_settings_restore_modal_apply, LV_EVENT_CLICKED, this);
+  lv_obj_t* restore_text = lv_label_create(restore_btn);
+  lv_label_set_text(restore_text, "Restore");
+  lv_obj_center(restore_text);
+}
+
+void SetupUi::close_sd_restore_modal() {
+  if (restore_modal_ == nullptr) return;
+  lv_obj_del(restore_modal_);
+  restore_modal_ = nullptr;
+  dd_restore_backup_ = nullptr;
+  restore_backup_paths_.clear();
+}
+
 void SetupUi::perform_sd_restore() {
+  if (dd_restore_backup_ == nullptr) return;
+  const uint16_t selected = lv_dropdown_get_selected(dd_restore_backup_);
+  if (selected >= restore_backup_paths_.size()) {
+    if (settings_status_ != nullptr) lv_label_set_text(settings_status_, "SD restore failed: invalid selection");
+    return;
+  }
+  const std::string backup_path = restore_backup_paths_[selected];
+
   std::vector<DeviceRecord> devices;
   std::vector<ActivityRecord> activities;
   std::string status;
-  if (!sd_backup_.restore_from_sd(&devices, &activities, &status)) {
+  if (!sd_backup_.restore_from_sd(backup_path, &devices, &activities, &status)) {
     if (settings_status_ != nullptr) lv_label_set_text(settings_status_, status.empty() ? "SD restore failed" : status.c_str());
     return;
   }
+
+  const bool normalized = normalize_restored_records(&devices, &activities);
 
   if (!device_registry_.replace_all(std::move(devices))) {
     if (settings_status_ != nullptr) lv_label_set_text(settings_status_, "SD restore failed: device save");
@@ -1531,16 +1854,528 @@ void SetupUi::perform_sd_restore() {
   rebuild_device_list();
   rebuild_activity_list();
   rebuild_remote_activity_dropdown();
+  close_sd_restore_modal();
+  if (normalized) {
+    status += " (normalized)";
+  }
   if (settings_status_ != nullptr) lv_label_set_text(settings_status_, status.c_str());
 }
 
-void SetupUi::perform_sd_format() {
-  std::string status;
-  if (sd_backup_.format_sd_card(&status)) {
-    if (settings_status_ != nullptr) lv_label_set_text(settings_status_, status.c_str());
+bool SetupUi::remove_device_references_from_activities(uint32_t device_id) {
+  const std::vector<ActivityRecord>& source = activity_registry_.all();
+  std::vector<ActivityRecord> updated = source;
+  bool changed = false;
+
+  for (ActivityRecord& activity : updated) {
+    const size_t before_devices = activity.device_ids.size();
+    activity.device_ids.erase(
+        std::remove(activity.device_ids.begin(), activity.device_ids.end(), device_id),
+        activity.device_ids.end());
+    if (activity.device_ids.size() != before_devices) changed = true;
+
+    const size_t before_bindings = activity.key_bindings.size();
+    activity.key_bindings.erase(
+        std::remove_if(activity.key_bindings.begin(), activity.key_bindings.end(),
+                       [&](const ActivityKeyBinding& binding) { return binding.device_id == device_id; }),
+        activity.key_bindings.end());
+    if (activity.key_bindings.size() != before_bindings) changed = true;
+
+    const size_t before_actions = activity.startup_actions.size();
+    activity.startup_actions.erase(
+        std::remove_if(activity.startup_actions.begin(), activity.startup_actions.end(),
+                       [&](const ActivityStartupAction& action) { return action.device_id == device_id; }),
+        activity.startup_actions.end());
+    if (activity.startup_actions.size() != before_actions) changed = true;
+  }
+
+  return changed ? activity_registry_.replace_all(std::move(updated)) : true;
+}
+
+bool SetupUi::remove_command_references_from_activities(uint32_t device_id, const std::string& command_name) {
+  const std::vector<ActivityRecord>& source = activity_registry_.all();
+  std::vector<ActivityRecord> updated = source;
+  bool changed = false;
+
+  for (ActivityRecord& activity : updated) {
+    const size_t before_bindings = activity.key_bindings.size();
+    activity.key_bindings.erase(
+        std::remove_if(activity.key_bindings.begin(), activity.key_bindings.end(),
+                       [&](const ActivityKeyBinding& binding) {
+                         return binding.device_id == device_id && binding.command_name == command_name;
+                       }),
+        activity.key_bindings.end());
+    if (activity.key_bindings.size() != before_bindings) changed = true;
+  }
+
+  return changed ? activity_registry_.replace_all(std::move(updated)) : true;
+}
+
+bool SetupUi::normalize_restored_records(std::vector<DeviceRecord>* devices, std::vector<ActivityRecord>* activities) const {
+  if (devices == nullptr || activities == nullptr) return false;
+  bool changed = false;
+
+  std::unordered_set<uint32_t> used_device_ids;
+  std::unordered_map<uint32_t, uint32_t> device_id_remap;
+  uint32_t next_device_id = 1;
+  for (DeviceRecord& device : *devices) {
+    if (device.name.empty()) {
+      device.name = "Restored Device";
+      changed = true;
+    }
+
+    const uint32_t original_id = device.id;
+    uint32_t normalized_id = original_id;
+    if (normalized_id == 0 || used_device_ids.find(normalized_id) != used_device_ids.end()) {
+      while (used_device_ids.find(next_device_id) != used_device_ids.end()) ++next_device_id;
+      normalized_id = next_device_id++;
+      changed = true;
+    }
+    used_device_ids.insert(normalized_id);
+    if (original_id != 0 && device_id_remap.find(original_id) == device_id_remap.end()) {
+      device_id_remap[original_id] = normalized_id;
+    }
+    device.id = normalized_id;
+  }
+
+  std::unordered_map<uint32_t, std::unordered_set<std::string>> command_index;
+  for (const DeviceRecord& device : *devices) {
+    std::unordered_set<std::string>& commands = command_index[device.id];
+    for (const DeviceCommand& command : device.commands) {
+      if (!command.name.empty()) commands.insert(command.name);
+    }
+  }
+
+  std::unordered_set<uint32_t> used_activity_ids;
+  uint32_t next_activity_id = 1;
+  for (ActivityRecord& activity : *activities) {
+    if (activity.name.empty()) {
+      activity.name = "Restored Activity";
+      changed = true;
+    }
+
+    const uint32_t original_id = activity.id;
+    uint32_t normalized_id = original_id;
+    if (normalized_id == 0 || used_activity_ids.find(normalized_id) != used_activity_ids.end()) {
+      while (used_activity_ids.find(next_activity_id) != used_activity_ids.end()) ++next_activity_id;
+      normalized_id = next_activity_id++;
+      changed = true;
+    }
+    used_activity_ids.insert(normalized_id);
+    activity.id = normalized_id;
+
+    std::vector<uint32_t> normalized_device_ids;
+    std::unordered_set<uint32_t> seen_activity_device_ids;
+    for (uint32_t id : activity.device_ids) {
+      auto mapped_it = device_id_remap.find(id);
+      if (mapped_it != device_id_remap.end()) id = mapped_it->second;
+      if (used_device_ids.find(id) == used_device_ids.end()) {
+        changed = true;
+        continue;
+      }
+      if (seen_activity_device_ids.insert(id).second) {
+        normalized_device_ids.push_back(id);
+      } else {
+        changed = true;
+      }
+    }
+    activity.device_ids = std::move(normalized_device_ids);
+
+    std::map<int, ActivityKeyBinding> latest_binding_by_key;
+    for (const ActivityKeyBinding& binding : activity.key_bindings) {
+      if (binding.command_name.empty()) {
+        changed = true;
+        continue;
+      }
+      uint32_t normalized_device = binding.device_id;
+      auto mapped_it = device_id_remap.find(normalized_device);
+      if (mapped_it != device_id_remap.end()) normalized_device = mapped_it->second;
+      if (used_device_ids.find(normalized_device) == used_device_ids.end()) {
+        changed = true;
+        continue;
+      }
+      auto command_it = command_index.find(normalized_device);
+      if (command_it == command_index.end() || command_it->second.find(binding.command_name) == command_it->second.end()) {
+        changed = true;
+        continue;
+      }
+
+      ActivityKeyBinding normalized_binding = binding;
+      normalized_binding.device_id = normalized_device;
+      latest_binding_by_key[static_cast<unsigned char>(normalized_binding.key_char)] = normalized_binding;
+    }
+    std::vector<ActivityKeyBinding> normalized_bindings;
+    normalized_bindings.reserve(latest_binding_by_key.size());
+    for (const auto& kv : latest_binding_by_key) {
+      normalized_bindings.push_back(kv.second);
+    }
+    if (normalized_bindings.size() != activity.key_bindings.size()) changed = true;
+    activity.key_bindings = std::move(normalized_bindings);
+
+    std::vector<ActivityStartupAction> normalized_actions;
+    normalized_actions.reserve(activity.startup_actions.size());
+    for (const ActivityStartupAction& action : activity.startup_actions) {
+      uint32_t normalized_device = action.device_id;
+      auto mapped_it = device_id_remap.find(normalized_device);
+      if (mapped_it != device_id_remap.end()) normalized_device = mapped_it->second;
+      if (used_device_ids.find(normalized_device) == used_device_ids.end()) {
+        changed = true;
+        continue;
+      }
+      const int slot_value = static_cast<int>(action.slot);
+      if (slot_value < 0 || slot_value >= static_cast<int>(CommandSlot::Count)) {
+        changed = true;
+        continue;
+      }
+      ActivityStartupAction normalized_action = action;
+      normalized_action.device_id = normalized_device;
+      normalized_actions.push_back(normalized_action);
+    }
+    if (normalized_actions.size() != activity.startup_actions.size()) changed = true;
+    activity.startup_actions = std::move(normalized_actions);
+  }
+
+  return changed;
+}
+
+void SetupUi::open_manual_time_modal() {
+  if (time_modal_ != nullptr) return;
+
+  const std::string timezone_value = load_timezone_setting();
+  apply_timezone_setting(timezone_value);
+
+  time_modal_ = lv_obj_create(root_);
+  lv_obj_set_size(time_modal_, SCR_WIDTH, SCR_HEIGHT);
+  lv_obj_center(time_modal_);
+  lv_obj_set_style_bg_color(time_modal_, lv_color_hex(0x202020), LV_PART_MAIN);
+  lv_obj_set_style_pad_all(time_modal_, 6, LV_PART_MAIN);
+  lv_obj_set_scroll_dir(time_modal_, LV_DIR_VER);
+  lv_obj_set_style_pad_bottom(time_modal_, 148, LV_PART_MAIN);
+
+  lv_obj_t* title = lv_label_create(time_modal_);
+  lv_label_set_text(title, "Set Time");
+  lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 6);
+
+  lv_obj_t* hint = lv_label_create(time_modal_);
+  lv_label_set_text(hint, "Format: YYYY-MM-DD HH:MM:SS");
+  lv_obj_align(hint, LV_ALIGN_TOP_LEFT, 0, 28);
+
+  ta_manual_time_ = lv_textarea_create(time_modal_);
+  lv_textarea_set_one_line(ta_manual_time_, true);
+  lv_obj_set_width(ta_manual_time_, SCR_WIDTH - 12);
+  lv_obj_align(ta_manual_time_, LV_ALIGN_TOP_LEFT, 0, 52);
+  lv_obj_add_event_cb(ta_manual_time_, on_textarea_focus, LV_EVENT_FOCUSED, this);
+  manual_time_initial_text_ = current_time_full_text();
+  lv_textarea_set_text(ta_manual_time_, manual_time_initial_text_.c_str());
+
+  lv_obj_t* tz_label = lv_label_create(time_modal_);
+  lv_label_set_text(tz_label, "Timezone");
+  lv_obj_align(tz_label, LV_ALIGN_TOP_LEFT, 0, 84);
+
+  dd_manual_timezone_ = lv_dropdown_create(time_modal_);
+  lv_obj_set_width(dd_manual_timezone_, SCR_WIDTH - 12);
+  lv_dropdown_set_options(dd_manual_timezone_, timezone_dropdown_options().c_str());
+  lv_obj_align(dd_manual_timezone_, LV_ALIGN_TOP_LEFT, 0, 102);
+  lv_dropdown_set_selected(dd_manual_timezone_, timezone_index_for_value(timezone_value));
+
+  lv_obj_t* close_btn = lv_btn_create(time_modal_);
+  lv_obj_set_size(close_btn, (SCR_WIDTH - 18) / 2, 32);
+  lv_obj_align(close_btn, LV_ALIGN_TOP_LEFT, 0, 140);
+  lv_obj_add_event_cb(close_btn, on_settings_time_modal_close, LV_EVENT_CLICKED, this);
+  lv_obj_t* close_text = lv_label_create(close_btn);
+  lv_label_set_text(close_text, "Close");
+  lv_obj_center(close_text);
+
+  lv_obj_t* apply_btn = lv_btn_create(time_modal_);
+  lv_obj_set_size(apply_btn, (SCR_WIDTH - 18) / 2, 32);
+  lv_obj_align(apply_btn, LV_ALIGN_TOP_RIGHT, 0, 140);
+  lv_obj_add_event_cb(apply_btn, on_settings_time_modal_apply, LV_EVENT_CLICKED, this);
+  lv_obj_t* apply_text = lv_label_create(apply_btn);
+  lv_label_set_text(apply_text, "Apply");
+  lv_obj_center(apply_text);
+
+  keyboard_ = lv_keyboard_create(root_);
+  lv_obj_set_size(keyboard_, SCR_WIDTH, 128);
+  lv_obj_align(keyboard_, LV_ALIGN_BOTTOM_MID, 0, 0);
+  lv_obj_add_flag(keyboard_, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_event_cb(keyboard_, on_keyboard_apply, LV_EVENT_READY, this);
+}
+
+void SetupUi::close_manual_time_modal() {
+  if (time_modal_ == nullptr) return;
+  lv_obj_del(time_modal_);
+  time_modal_ = nullptr;
+  ta_manual_time_ = nullptr;
+  dd_manual_timezone_ = nullptr;
+  manual_time_initial_text_.clear();
+  if (keyboard_ != nullptr) {
+    lv_obj_del(keyboard_);
+    keyboard_ = nullptr;
+  }
+}
+
+bool SetupUi::apply_manual_time_modal() {
+  if (ta_manual_time_ == nullptr || dd_manual_timezone_ == nullptr) return false;
+
+  const uint16_t tz_index = lv_dropdown_get_selected(dd_manual_timezone_);
+  const std::string timezone_value = timezone_value_for_index(tz_index);
+  apply_timezone_setting(timezone_value);
+  if (!save_timezone_setting(timezone_value)) {
+    if (settings_status_ != nullptr) lv_label_set_text(settings_status_, "Timezone save failed");
+    return false;
+  }
+
+  const std::string raw = trim_copy(lv_textarea_get_text(ta_manual_time_));
+  const bool time_changed = raw != manual_time_initial_text_;
+  if (!time_changed) {
+    update_status_bar();
+    if (settings_status_ != nullptr) {
+      lv_label_set_text_fmt(settings_status_, "Timezone set: %s", timezone_label_for_index(tz_index));
+    }
+    return true;
+  }
+
+  struct tm parsed {};
+  if (!parse_manual_datetime(raw, &parsed)) {
+    if (settings_status_ != nullptr) lv_label_set_text(settings_status_, "Manual time failed: invalid format");
+    return false;
+  }
+  time_t epoch = mktime(&parsed);
+  if (epoch <= 0) {
+    if (settings_status_ != nullptr) lv_label_set_text(settings_status_, "Manual time failed: invalid date/time");
+    return false;
+  }
+  struct timeval tv {};
+  tv.tv_sec = epoch;
+  tv.tv_usec = 0;
+  if (settimeofday(&tv, nullptr) != 0) {
+    if (settings_status_ != nullptr) lv_label_set_text(settings_status_, "Manual time failed: settimeofday");
+    return false;
+  }
+  update_status_bar();
+  if (settings_status_ != nullptr) {
+    const std::string status = "Time/timezone set: " + raw;
+    lv_label_set_text(settings_status_, status.c_str());
+  }
+  return true;
+}
+
+void SetupUi::open_wifi_modal() {
+  if (wifi_modal_ != nullptr) return;
+
+  wifi_modal_ = lv_obj_create(root_);
+  lv_obj_set_size(wifi_modal_, SCR_WIDTH, SCR_HEIGHT);
+  lv_obj_center(wifi_modal_);
+  lv_obj_set_style_bg_color(wifi_modal_, lv_color_hex(0x202020), LV_PART_MAIN);
+  lv_obj_set_style_pad_all(wifi_modal_, 6, LV_PART_MAIN);
+  lv_obj_set_scroll_dir(wifi_modal_, LV_DIR_VER);
+  lv_obj_set_style_pad_bottom(wifi_modal_, 148, LV_PART_MAIN);
+
+  lv_obj_t* title = lv_label_create(wifi_modal_);
+  lv_label_set_text(title, "WiFi Settings");
+  lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 6);
+
+  lv_obj_t* network_label = lv_label_create(wifi_modal_);
+  lv_label_set_text(network_label, "Network");
+  lv_obj_align(network_label, LV_ALIGN_TOP_LEFT, 0, 28);
+
+  dd_wifi_network_ = lv_dropdown_create(wifi_modal_);
+  lv_obj_set_width(dd_wifi_network_, SCR_WIDTH - 12);
+  lv_obj_align(dd_wifi_network_, LV_ALIGN_TOP_LEFT, 0, 46);
+  lv_dropdown_set_options(dd_wifi_network_, "Scanning...");
+
+  lv_obj_t* password_label = lv_label_create(wifi_modal_);
+  lv_label_set_text(password_label, "Password");
+  lv_obj_align(password_label, LV_ALIGN_TOP_LEFT, 0, 84);
+
+  ta_wifi_password_ = lv_textarea_create(wifi_modal_);
+  lv_textarea_set_one_line(ta_wifi_password_, true);
+  lv_obj_set_width(ta_wifi_password_, SCR_WIDTH - 12);
+  lv_textarea_set_placeholder_text(ta_wifi_password_, "WiFi password");
+  lv_obj_align(ta_wifi_password_, LV_ALIGN_TOP_LEFT, 0, 102);
+  lv_obj_add_event_cb(ta_wifi_password_, on_textarea_focus, LV_EVENT_FOCUSED, this);
+
+  lv_obj_t* scan_btn = lv_btn_create(wifi_modal_);
+  lv_obj_set_size(scan_btn, (SCR_WIDTH - 24) / 3, 32);
+  lv_obj_align(scan_btn, LV_ALIGN_TOP_LEFT, 0, 138);
+  lv_obj_add_event_cb(scan_btn, on_wifi_modal_scan, LV_EVENT_CLICKED, this);
+  lv_obj_t* scan_text = lv_label_create(scan_btn);
+  lv_label_set_text(scan_text, "Scan");
+  lv_obj_center(scan_text);
+
+  lv_obj_t* connect_btn = lv_btn_create(wifi_modal_);
+  lv_obj_set_size(connect_btn, (SCR_WIDTH - 24) / 3, 32);
+  lv_obj_align(connect_btn, LV_ALIGN_TOP_MID, 0, 138);
+  lv_obj_add_event_cb(connect_btn, on_wifi_modal_connect, LV_EVENT_CLICKED, this);
+  lv_obj_t* connect_text = lv_label_create(connect_btn);
+  lv_label_set_text(connect_text, "Connect");
+  lv_obj_center(connect_text);
+
+  lv_obj_t* forget_btn = lv_btn_create(wifi_modal_);
+  lv_obj_set_size(forget_btn, (SCR_WIDTH - 24) / 3, 32);
+  lv_obj_align(forget_btn, LV_ALIGN_TOP_RIGHT, 0, 138);
+  lv_obj_add_event_cb(forget_btn, on_wifi_modal_forget, LV_EVENT_CLICKED, this);
+  lv_obj_t* forget_text = lv_label_create(forget_btn);
+  lv_label_set_text(forget_text, "Forget");
+  lv_obj_center(forget_text);
+
+  lv_obj_t* close_btn = lv_btn_create(wifi_modal_);
+  lv_obj_set_size(close_btn, SCR_WIDTH - 12, 32);
+  lv_obj_align(close_btn, LV_ALIGN_TOP_LEFT, 0, 176);
+  lv_obj_add_event_cb(close_btn, on_wifi_modal_close, LV_EVENT_CLICKED, this);
+  lv_obj_t* close_text = lv_label_create(close_btn);
+  lv_label_set_text(close_text, "Close");
+  lv_obj_center(close_text);
+
+  wifi_modal_status_ = lv_label_create(wifi_modal_);
+  lv_obj_set_width(wifi_modal_status_, SCR_WIDTH - 12);
+  lv_label_set_long_mode(wifi_modal_status_, LV_LABEL_LONG_WRAP);
+  lv_label_set_text(wifi_modal_status_, "Scan and connect to a network.");
+  lv_obj_align(wifi_modal_status_, LV_ALIGN_TOP_LEFT, 0, 214);
+
+  keyboard_ = lv_keyboard_create(root_);
+  lv_obj_set_size(keyboard_, SCR_WIDTH, 128);
+  lv_obj_align(keyboard_, LV_ALIGN_BOTTOM_MID, 0, 0);
+  lv_obj_add_flag(keyboard_, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_event_cb(keyboard_, on_keyboard_apply, LV_EVENT_READY, this);
+
+  refresh_wifi_scan_list();
+
+  std::string saved_ssid;
+  std::string saved_password;
+#if (ENABLE_WIFI_AND_MQTT == 1)
+  if (wifi_get_saved_credentials_HAL(&saved_ssid, &saved_password)) {
+    lv_textarea_set_text(ta_wifi_password_, saved_password.c_str());
+    if (wifi_modal_status_ != nullptr) {
+      lv_label_set_text_fmt(wifi_modal_status_, "Saved network: %s", saved_ssid.c_str());
+    }
+  }
+#else
+  if (wifi_modal_status_ != nullptr) {
+    lv_label_set_text(wifi_modal_status_, "WiFi is disabled in build flags");
+  }
+#endif
+}
+
+void SetupUi::close_wifi_modal() {
+  if (wifi_modal_ == nullptr) return;
+  lv_obj_del(wifi_modal_);
+  wifi_modal_ = nullptr;
+  dd_wifi_network_ = nullptr;
+  ta_wifi_password_ = nullptr;
+  wifi_modal_status_ = nullptr;
+  wifi_scan_results_.clear();
+  if (keyboard_ != nullptr) {
+    lv_obj_del(keyboard_);
+    keyboard_ = nullptr;
+  }
+}
+
+void SetupUi::refresh_wifi_scan_list() {
+  if (dd_wifi_network_ == nullptr) return;
+
+#if (ENABLE_WIFI_AND_MQTT == 1)
+  std::vector<std::string> scanned;
+  if (!wifi_scan_networks_HAL(&scanned)) {
+    if (wifi_modal_status_ != nullptr) {
+      lv_label_set_text(wifi_modal_status_, "WiFi scan failed");
+    }
+    lv_dropdown_set_options(dd_wifi_network_, "No networks");
+    wifi_scan_results_.clear();
     return;
   }
-  if (settings_status_ != nullptr) lv_label_set_text(settings_status_, status.empty() ? "SD format failed" : status.c_str());
+
+  std::string saved_ssid;
+  std::string saved_password;
+  if (wifi_get_saved_credentials_HAL(&saved_ssid, &saved_password) && !saved_ssid.empty()) {
+    if (std::find(scanned.begin(), scanned.end(), saved_ssid) == scanned.end()) {
+      scanned.insert(scanned.begin(), saved_ssid);
+    }
+  }
+
+  wifi_scan_results_ = scanned;
+  std::string options;
+  for (size_t i = 0; i < wifi_scan_results_.size(); ++i) {
+    if (!options.empty()) options += "\n";
+    options += wifi_scan_results_[i];
+  }
+  if (options.empty()) {
+    options = "No networks";
+  }
+  lv_dropdown_set_options(dd_wifi_network_, options.c_str());
+
+  if (!saved_ssid.empty()) {
+    for (uint16_t i = 0; i < wifi_scan_results_.size(); ++i) {
+      if (wifi_scan_results_[i] == saved_ssid) {
+        lv_dropdown_set_selected(dd_wifi_network_, i);
+        break;
+      }
+    }
+  }
+
+  if (wifi_modal_status_ != nullptr) {
+    lv_label_set_text_fmt(wifi_modal_status_, "Found %u network(s)", static_cast<unsigned>(wifi_scan_results_.size()));
+  }
+#else
+  lv_dropdown_set_options(dd_wifi_network_, "WiFi disabled");
+  wifi_scan_results_.clear();
+  if (wifi_modal_status_ != nullptr) {
+    lv_label_set_text(wifi_modal_status_, "WiFi is disabled in build flags");
+  }
+#endif
+}
+
+bool SetupUi::connect_wifi_from_modal() {
+  if (dd_wifi_network_ == nullptr || ta_wifi_password_ == nullptr) return false;
+
+#if (ENABLE_WIFI_AND_MQTT == 1)
+  char ssid_buf[80];
+  lv_dropdown_get_selected_str(dd_wifi_network_, ssid_buf, sizeof(ssid_buf));
+  const std::string ssid = trim_copy(ssid_buf);
+  if (ssid.empty() || ssid == "No networks") {
+    if (wifi_modal_status_ != nullptr) lv_label_set_text(wifi_modal_status_, "Pick a WiFi network first");
+    return false;
+  }
+
+  const std::string password = lv_textarea_get_text(ta_wifi_password_);
+  if (!wifi_set_credentials_HAL(ssid, password)) {
+    if (wifi_modal_status_ != nullptr) lv_label_set_text(wifi_modal_status_, "Failed to save/connect WiFi");
+    if (settings_status_ != nullptr) lv_label_set_text(settings_status_, "WiFi connect failed");
+    wifi_connect_attempt_active_ = false;
+    return false;
+  }
+
+  if (wifi_modal_status_ != nullptr) {
+    lv_label_set_text_fmt(wifi_modal_status_, "Connecting to %s...", ssid.c_str());
+  }
+  if (settings_status_ != nullptr) {
+    lv_label_set_text_fmt(settings_status_, "WiFi connecting: %s", ssid.c_str());
+  }
+  wifi_connect_attempt_active_ = true;
+  wifi_connect_attempt_started_ms_ = millis();
+  wifi_connect_target_ssid_ = ssid;
+  update_status_bar();
+  return true;
+#else
+  if (wifi_modal_status_ != nullptr) lv_label_set_text(wifi_modal_status_, "WiFi is disabled in build flags");
+  return false;
+#endif
+}
+
+void SetupUi::forget_wifi_credentials() {
+#if (ENABLE_WIFI_AND_MQTT == 1)
+  if (!wifi_clear_saved_credentials_HAL()) {
+    if (wifi_modal_status_ != nullptr) lv_label_set_text(wifi_modal_status_, "Failed to forget WiFi credentials");
+    return;
+  }
+  if (ta_wifi_password_ != nullptr) lv_textarea_set_text(ta_wifi_password_, "");
+  if (wifi_modal_status_ != nullptr) lv_label_set_text(wifi_modal_status_, "Saved WiFi credentials removed");
+  if (settings_status_ != nullptr) lv_label_set_text(settings_status_, "WiFi credentials removed");
+  wifi_connect_attempt_active_ = false;
+  wifi_connect_target_ssid_.clear();
+  update_status_bar();
+#else
+  if (wifi_modal_status_ != nullptr) lv_label_set_text(wifi_modal_status_, "WiFi is disabled in build flags");
+#endif
 }
 
 void SetupUi::dispatch_remote_command(CommandSlot slot) {
@@ -1607,10 +2442,23 @@ void SetupUi::on_device_add_clicked(lv_event_t* event) {
 void SetupUi::on_device_remove_clicked(lv_event_t* event) {
   SetupUi* self = static_cast<SetupUi*>(lv_event_get_user_data(event));
   if (self == nullptr || self->selected_device_index_ < 0) return;
-  self->device_registry_.remove_by_index(static_cast<size_t>(self->selected_device_index_));
+  const DeviceRecord* selected = self->selected_device();
+  if (selected == nullptr) return;
+  const uint32_t removed_device_id = selected->id;
+  if (!self->device_registry_.remove_by_index(static_cast<size_t>(self->selected_device_index_))) return;
+  if (!self->remove_device_references_from_activities(removed_device_id) && self->settings_status_ != nullptr) {
+    lv_label_set_text(self->settings_status_, "Warning: failed to clean activity refs");
+  }
   self->selected_device_index_ = -1;
   self->rebuild_device_list();
+  self->rebuild_activity_list();
   self->rebuild_remote_activity_dropdown();
+  if (self->activity_keymap_modal_ != nullptr) {
+    self->refresh_activity_key_options();
+    self->refresh_activity_keymap_device_dropdown();
+    self->refresh_activity_keymap_command_dropdown();
+    self->refresh_activity_keymap_binding_hint();
+  }
 }
 
 void SetupUi::on_device_rename_clicked(lv_event_t* event) {
@@ -1738,6 +2586,7 @@ void SetupUi::on_textarea_focus(lv_event_t* event) {
   lv_obj_t* target = lv_event_get_target(event);
   lv_keyboard_set_textarea(self->keyboard_, target);
   lv_obj_clear_flag(self->keyboard_, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_scroll_to_view_recursive(target, LV_ANIM_ON);
 }
 
 void SetupUi::on_activity_clicked(lv_event_t* event) {
@@ -1862,13 +2711,71 @@ void SetupUi::on_settings_backup_clicked(lv_event_t* event) {
 void SetupUi::on_settings_restore_clicked(lv_event_t* event) {
   SetupUi* self = static_cast<SetupUi*>(lv_event_get_user_data(event));
   if (self == nullptr) return;
+  self->open_sd_restore_modal();
+}
+
+void SetupUi::on_settings_restore_modal_close(lv_event_t* event) {
+  SetupUi* self = static_cast<SetupUi*>(lv_event_get_user_data(event));
+  if (self == nullptr) return;
+  self->close_sd_restore_modal();
+}
+
+void SetupUi::on_settings_restore_modal_apply(lv_event_t* event) {
+  SetupUi* self = static_cast<SetupUi*>(lv_event_get_user_data(event));
+  if (self == nullptr) return;
   self->perform_sd_restore();
 }
 
-void SetupUi::on_settings_format_clicked(lv_event_t* event) {
+void SetupUi::on_settings_wifi_clicked(lv_event_t* event) {
   SetupUi* self = static_cast<SetupUi*>(lv_event_get_user_data(event));
   if (self == nullptr) return;
-  self->perform_sd_format();
+  self->open_wifi_modal();
+}
+
+void SetupUi::on_settings_set_time_clicked(lv_event_t* event) {
+  SetupUi* self = static_cast<SetupUi*>(lv_event_get_user_data(event));
+  if (self == nullptr) return;
+  self->open_manual_time_modal();
+}
+
+void SetupUi::on_settings_time_modal_close(lv_event_t* event) {
+  SetupUi* self = static_cast<SetupUi*>(lv_event_get_user_data(event));
+  if (self == nullptr) return;
+  self->close_manual_time_modal();
+}
+
+void SetupUi::on_settings_time_modal_apply(lv_event_t* event) {
+  SetupUi* self = static_cast<SetupUi*>(lv_event_get_user_data(event));
+  if (self == nullptr) return;
+  if (self->apply_manual_time_modal()) {
+    self->close_manual_time_modal();
+  }
+}
+
+void SetupUi::on_wifi_modal_close(lv_event_t* event) {
+  SetupUi* self = static_cast<SetupUi*>(lv_event_get_user_data(event));
+  if (self == nullptr) return;
+  self->close_wifi_modal();
+}
+
+void SetupUi::on_wifi_modal_scan(lv_event_t* event) {
+  SetupUi* self = static_cast<SetupUi*>(lv_event_get_user_data(event));
+  if (self == nullptr) return;
+  self->refresh_wifi_scan_list();
+}
+
+void SetupUi::on_wifi_modal_connect(lv_event_t* event) {
+  SetupUi* self = static_cast<SetupUi*>(lv_event_get_user_data(event));
+  if (self == nullptr) return;
+  if (self->connect_wifi_from_modal()) {
+    self->close_wifi_modal();
+  }
+}
+
+void SetupUi::on_wifi_modal_forget(lv_event_t* event) {
+  SetupUi* self = static_cast<SetupUi*>(lv_event_get_user_data(event));
+  if (self == nullptr) return;
+  self->forget_wifi_credentials();
 }
 
 void SetupUi::on_remote_activity_changed(lv_event_t* event) {

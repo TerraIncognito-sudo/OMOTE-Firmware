@@ -57,7 +57,16 @@ class SetupUi {
   static void on_activity_builder_save(lv_event_t* event);
   static void on_settings_backup_clicked(lv_event_t* event);
   static void on_settings_restore_clicked(lv_event_t* event);
-  static void on_settings_format_clicked(lv_event_t* event);
+  static void on_settings_restore_modal_close(lv_event_t* event);
+  static void on_settings_restore_modal_apply(lv_event_t* event);
+  static void on_settings_wifi_clicked(lv_event_t* event);
+  static void on_settings_set_time_clicked(lv_event_t* event);
+  static void on_settings_time_modal_close(lv_event_t* event);
+  static void on_settings_time_modal_apply(lv_event_t* event);
+  static void on_wifi_modal_close(lv_event_t* event);
+  static void on_wifi_modal_scan(lv_event_t* event);
+  static void on_wifi_modal_connect(lv_event_t* event);
+  static void on_wifi_modal_forget(lv_event_t* event);
   static void on_remote_activity_changed(lv_event_t* event);
   static void on_remote_command_clicked(lv_event_t* event);
   static void on_keyboard_apply(lv_event_t* event);
@@ -95,6 +104,7 @@ class SetupUi {
   void open_activity_keymap_modal();
   void close_activity_keymap_modal();
   void save_activity_keymap_modal();
+  void refresh_activity_key_options();
   void refresh_activity_keymap_device_dropdown();
   void refresh_activity_keymap_command_dropdown();
   void refresh_activity_keymap_binding_hint();
@@ -105,8 +115,20 @@ class SetupUi {
   void activity_builder_save();
   void refresh_activity_builder_preview();
   void perform_sd_backup();
+  void open_sd_restore_modal();
+  void close_sd_restore_modal();
   void perform_sd_restore();
-  void perform_sd_format();
+  void open_manual_time_modal();
+  void close_manual_time_modal();
+  bool apply_manual_time_modal();
+  void open_wifi_modal();
+  void close_wifi_modal();
+  void refresh_wifi_scan_list();
+  bool connect_wifi_from_modal();
+  void forget_wifi_credentials();
+  bool remove_device_references_from_activities(uint32_t device_id);
+  bool remove_command_references_from_activities(uint32_t device_id, const std::string& command_name);
+  bool normalize_restored_records(std::vector<DeviceRecord>* devices, std::vector<ActivityRecord>* activities) const;
   void execute_activity_startup_actions(const ActivityRecord& activity);
   void dispatch_remote_command(CommandSlot slot);
   void dispatch_physical_key(char key_char);
@@ -124,6 +146,7 @@ class SetupUi {
   lv_obj_t* root_ = nullptr;
   lv_obj_t* status_bar_ = nullptr;
   lv_obj_t* wifi_status_label_ = nullptr;
+  lv_obj_t* time_status_label_ = nullptr;
   lv_obj_t* battery_status_label_ = nullptr;
   lv_obj_t* tabview_ = nullptr;
   lv_obj_t* devices_page_ = nullptr;
@@ -182,7 +205,17 @@ class SetupUi {
   lv_obj_t* settings_status_ = nullptr;
   lv_obj_t* settings_backup_btn_ = nullptr;
   lv_obj_t* settings_restore_btn_ = nullptr;
-  lv_obj_t* settings_format_btn_ = nullptr;
+  lv_obj_t* settings_wifi_btn_ = nullptr;
+  lv_obj_t* settings_set_time_btn_ = nullptr;
+  lv_obj_t* restore_modal_ = nullptr;
+  lv_obj_t* dd_restore_backup_ = nullptr;
+  lv_obj_t* time_modal_ = nullptr;
+  lv_obj_t* ta_manual_time_ = nullptr;
+  lv_obj_t* dd_manual_timezone_ = nullptr;
+  lv_obj_t* wifi_modal_ = nullptr;
+  lv_obj_t* dd_wifi_network_ = nullptr;
+  lv_obj_t* ta_wifi_password_ = nullptr;
+  lv_obj_t* wifi_modal_status_ = nullptr;
 
   lv_obj_t* keyboard_ = nullptr;
   unsigned long last_status_update_ms_ = 0;
@@ -196,6 +229,14 @@ class SetupUi {
   std::vector<uint32_t> keymap_device_ids_;
   std::vector<uint32_t> activity_builder_device_ids_;
   std::vector<ActivityStartupAction> activity_builder_actions_;
+  std::vector<std::string> restore_backup_paths_;
+  std::vector<std::string> wifi_scan_results_;
+  std::string manual_time_initial_text_;
+  bool wifi_connect_attempt_active_ = false;
+  unsigned long wifi_connect_attempt_started_ms_ = 0;
+  std::string wifi_connect_target_ssid_;
+  bool last_wifi_connected_known_ = false;
+  bool last_wifi_connected_ = false;
 };
 
 }  // namespace omote_v2

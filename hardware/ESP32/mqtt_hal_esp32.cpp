@@ -1,6 +1,9 @@
 #include <sstream>
+#include <algorithm>
+#include <vector>
 #include "WiFi.h"
 #include <PubSubClient.h>
+#include <Preferences.h>
 #include "mqtt_hal_esp32.h"
 #if (ENABLE_KEYBOARD_BLE == 1)
 #include "keyboard_ble_hal_esp32.h"
@@ -11,6 +14,12 @@
 WiFiClient espClient;
 PubSubClient mqttClient(espClient);
 bool isWifiConnected = false;
+bool wifiCredentialsLoaded = false;
+std::string savedWifiSsid = "";
+std::string savedWifiPassword = "";
+constexpr const char* kWifiPrefsNs = "omotev2wifi";
+constexpr const char* kWifiSsidKey = "ssid";
+constexpr const char* kWifiPasswordKey = "password";
 
 tAnnounceWiFiconnected_cb thisAnnounceWiFiconnected_cb = NULL;
 void set_announceWiFiconnected_cb_HAL(tAnnounceWiFiconnected_cb pAnnounceWiFiconnected_cb) {
@@ -20,6 +29,86 @@ void set_announceWiFiconnected_cb_HAL(tAnnounceWiFiconnected_cb pAnnounceWiFicon
 tAnnounceSubscribedTopics_cb thisAnnounceSubscribedTopics_cb = NULL;
 void set_announceSubscribedTopics_cb_HAL(tAnnounceSubscribedTopics_cb pAnnounceSubscribedTopics_cb) {
   thisAnnounceSubscribedTopics_cb = pAnnounceSubscribedTopics_cb;  
+}
+
+static void announce_wifi_connected(bool connected) {
+  if (thisAnnounceWiFiconnected_cb != NULL) {
+    thisAnnounceWiFiconnected_cb(connected);
+  }
+}
+
+static void announce_subscribed_topic(const std::string& topic, const std::string& payload) {
+  if (thisAnnounceSubscribedTopics_cb != NULL) {
+    thisAnnounceSubscribedTopics_cb(topic, payload);
+  }
+}
+
+static bool is_default_placeholder_ssid(const std::string& ssid) {
+  return ssid == "YourWifiSSID";
+}
+
+static void load_wifi_credentials_once() {
+  if (wifiCredentialsLoaded) return;
+  Preferences prefs;
+  if (prefs.begin(kWifiPrefsNs, true)) {
+    savedWifiSsid = std::string(prefs.getString(kWifiSsidKey, "").c_str());
+    savedWifiPassword = std::string(prefs.getString(kWifiPasswordKey, "").c_str());
+    prefs.end();
+  }
+  wifiCredentialsLoaded = true;
+}
+
+static bool save_wifi_credentials_internal(const std::string& ssid, const std::string& password) {
+  Preferences prefs;
+  if (!prefs.begin(kWifiPrefsNs, false)) return false;
+  prefs.putString(kWifiSsidKey, ssid.c_str());
+  prefs.putString(kWifiPasswordKey, password.c_str());
+  prefs.end();
+  savedWifiSsid = ssid;
+  savedWifiPassword = password;
+  wifiCredentialsLoaded = true;
+  return true;
+}
+
+static bool clear_wifi_credentials_internal() {
+  Preferences prefs;
+  if (!prefs.begin(kWifiPrefsNs, false)) return false;
+  prefs.remove(kWifiSsidKey);
+  prefs.remove(kWifiPasswordKey);
+  prefs.end();
+  savedWifiSsid.clear();
+  savedWifiPassword.clear();
+  wifiCredentialsLoaded = true;
+  return true;
+}
+
+static bool get_effective_wifi_credentials(std::string* out_ssid, std::string* out_password) {
+  if (out_ssid == NULL || out_password == NULL) return false;
+  load_wifi_credentials_once();
+  if (!savedWifiSsid.empty()) {
+    *out_ssid = savedWifiSsid;
+    *out_password = savedWifiPassword;
+    return true;
+  }
+
+  const std::string compiledSsid = WIFI_SSID;
+  if (compiledSsid.empty() || is_default_placeholder_ssid(compiledSsid)) return false;
+  *out_ssid = compiledSsid;
+  *out_password = WIFI_PASSWORD;
+  return true;
+}
+
+static bool start_wifi_with_effective_credentials() {
+  std::string ssid;
+  std::string password;
+  if (!get_effective_wifi_credentials(&ssid, &password)) {
+    Serial.printf("WiFi settings missing. Configure SSID/password in Settings -> WiFi.\r\n");
+    return false;
+  }
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid.c_str(), password.c_str());
+  return true;
 }
 
 bool getIsWifiConnected_HAL() {
@@ -39,21 +128,21 @@ void WiFiEvent(WiFiEvent_t event){
   // Set status bar icon based on WiFi status
   if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP || event == ARDUINO_EVENT_WIFI_STA_GOT_IP6) {
     isWifiConnected = true;
-    thisAnnounceWiFiconnected_cb(true);
+    announce_wifi_connected(true);
     Serial.printf("WiFi connected, IP address: %s\r\n", WiFi.localIP().toString().c_str());
 
   } else if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
     isWifiConnected = false;
-    thisAnnounceWiFiconnected_cb(false);
+    announce_wifi_connected(false);
     // automatically try to reconnect
     Serial.printf("WiFi got disconnected. Will try to reconnect.\r\n");
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    start_wifi_with_effective_credentials();
 
   } else {
     // e.g. ARDUINO_EVENT_WIFI_STA_CONNECTED or many others
     // connected is not enough, will wait for IP
     isWifiConnected = false;
-    thisAnnounceWiFiconnected_cb(false);
+    announce_wifi_connected(false);
 
   }
 }
@@ -62,7 +151,7 @@ void init_mqtt_HAL(void) {
   // Setup WiFi
   WiFi.setHostname("OMOTE"); //define hostname
   WiFi.onEvent(WiFiEvent);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  start_wifi_with_effective_credentials();
   WiFi.setSleep(true);
 }
 
@@ -88,7 +177,7 @@ void callback(char* topic, byte* payload, unsigned int length) {
     // ...
 
     // Or forward the topic to "void receiveMQTTmessage_cb" in the "commandHandler.cpp", if it is not ESP32 hardware related
-    thisAnnounceSubscribedTopics_cb(topicReceived, strPayload);
+    announce_subscribed_topic(topicReceived, strPayload);
 
   #if (ENABLE_KEYBOARD_BLE == 1)
   } else if (topicReceived == subscribeTopicOMOTE_BLEstartAdvertisingForAll) {
@@ -126,7 +215,7 @@ void callback(char* topic, byte* payload, unsigned int length) {
 
   } else {
     // forward all other topics to the commandHandler
-    thisAnnounceSubscribedTopics_cb(topicReceived, strPayload);
+    announce_subscribed_topic(topicReceived, strPayload);
 
   }
 }
@@ -216,6 +305,55 @@ bool publishMQTTMessage_HAL(const char *topic, const char *payload){
 void wifi_shutdown_HAL() {
   WiFi.disconnect();
   WiFi.mode(WIFI_OFF);
+}
+
+bool wifi_scan_networks_HAL(std::vector<std::string>* out_ssids) {
+  if (out_ssids == NULL) return false;
+  out_ssids->clear();
+
+  WiFi.mode(WIFI_STA);
+  int count = WiFi.scanNetworks();
+  if (count < 0) {
+    return false;
+  }
+
+  out_ssids->reserve(static_cast<size_t>(count));
+  for (int i = 0; i < count; ++i) {
+    std::string ssid = std::string(WiFi.SSID(i).c_str());
+    if (ssid.empty()) continue;
+    if (std::find(out_ssids->begin(), out_ssids->end(), ssid) != out_ssids->end()) continue;
+    out_ssids->push_back(ssid);
+  }
+  WiFi.scanDelete();
+  return true;
+}
+
+bool wifi_set_credentials_HAL(const std::string& ssid, const std::string& password) {
+  if (ssid.empty()) return false;
+  if (!save_wifi_credentials_internal(ssid, password)) {
+    return false;
+  }
+
+  WiFi.disconnect();
+  delay(50);
+  return start_wifi_with_effective_credentials();
+}
+
+bool wifi_get_saved_credentials_HAL(std::string* out_ssid, std::string* out_password) {
+  if (out_ssid == NULL || out_password == NULL) return false;
+  load_wifi_credentials_once();
+  *out_ssid = savedWifiSsid;
+  *out_password = savedWifiPassword;
+  return !savedWifiSsid.empty();
+}
+
+bool wifi_clear_saved_credentials_HAL() {
+  WiFi.disconnect();
+  return clear_wifi_credentials_internal();
+}
+
+bool wifi_connect_saved_HAL() {
+  return start_wifi_with_effective_credentials();
 }
 
 #endif

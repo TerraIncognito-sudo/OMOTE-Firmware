@@ -224,4 +224,32 @@ void wifi_shutdown_HAL() {
 
 }
 
+bool wifi_scan_networks_HAL(std::vector<std::string>* out_ssids) {
+  if (out_ssids == NULL) return false;
+  out_ssids->clear();
+  out_ssids->push_back(std::string(WIFI_SSID));
+  return true;
+}
+
+bool wifi_set_credentials_HAL(const std::string& ssid, const std::string& password) {
+  (void)ssid;
+  (void)password;
+  return true;
+}
+
+bool wifi_get_saved_credentials_HAL(std::string* out_ssid, std::string* out_password) {
+  if (out_ssid == NULL || out_password == NULL) return false;
+  *out_ssid = "";
+  *out_password = "";
+  return false;
+}
+
+bool wifi_clear_saved_credentials_HAL() {
+  return true;
+}
+
+bool wifi_connect_saved_HAL() {
+  return true;
+}
+
 #endif

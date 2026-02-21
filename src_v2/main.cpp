@@ -1,6 +1,8 @@
 #include <Arduino.h>
 #include <lvgl.h>
 #include <nvs_flash.h>
+#include <time.h>
+#include <Preferences.h>
 
 #include "hardwareLayer.h"
 
@@ -29,6 +31,24 @@ unsigned long g_charge_protection_timer_ms = 0;
 bool g_charge_cutoff_applied = false;
 unsigned long g_activity_check_timer_ms = 0;
 
+namespace {
+constexpr const char* kUiPrefsNs = "omotev2ui";
+constexpr const char* kUiTimezoneKey = "timezone";
+constexpr const char* kDefaultTimezoneValue = "EST5EDT,M3.2.0/2,M11.1.0/2";
+
+void apply_saved_timezone_setting() {
+  Preferences prefs;
+  std::string timezone = kDefaultTimezoneValue;
+  if (prefs.begin(kUiPrefsNs, true)) {
+    timezone = std::string(prefs.getString(kUiTimezoneKey, kDefaultTimezoneValue).c_str());
+    prefs.end();
+  }
+  if (timezone.empty()) timezone = kDefaultTimezoneValue;
+  setenv("TZ", timezone.c_str(), 1);
+  tzset();
+}
+}  // namespace
+
 void setup() {
   Serial.begin(115200);
 
@@ -51,6 +71,11 @@ void setup() {
   init_battery_HAL();
   init_keys_HAL();
   init_IMU_HAL();
+  apply_saved_timezone_setting();
+#if (ENABLE_WIFI_AND_MQTT == 1)
+  init_mqtt_HAL();
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov", "time.google.com");
+#endif
 
   g_registry.load();
   g_activity_registry.load();
@@ -101,6 +126,9 @@ void loop() {
     g_activity_check_timer_ms = millis();
     check_activity_HAL();
   }
+#if (ENABLE_WIFI_AND_MQTT == 1)
+  mqtt_loop_HAL();
+#endif
 
   keys_getKeys_HAL(g_raw_keys, millis());
   for (uint8_t row = 0; row < kRows; ++row) {
