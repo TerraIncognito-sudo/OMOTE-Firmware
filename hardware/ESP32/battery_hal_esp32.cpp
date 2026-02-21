@@ -1,5 +1,10 @@
 #include <Arduino.h>
 
+namespace {
+bool g_battery_init_done = false;
+bool g_charge_enabled = true;
+}
+
 #if (OMOTE_HARDWARE_REV <= 3)
   const uint8_t ADC_BAT_GPIO = 36;  // Battery voltage sense input (1/2 divider), GPIO36, ADC1_CH0, RTC_GPIO0
   // const uint8_t CRG_STAT_GPIO = 21; // battery charger feedback,                  GPIO21, VSPIHD, EMAC_TX_EN
@@ -17,27 +22,53 @@
 
 void init_battery_HAL(void) {
   #if (OMOTE_HARDWARE_REV >= 4)
-    // Initialize battery charger indicator input
-    pinMode(CRG_STAT_GPIO, INPUT_PULLUP);   
+    #if (OMOTE_HARDWARE_REV >= 5)
+      // Rev5+: schematic routes TP4056 CE to this GPIO (active-low enable).
+      pinMode(CRG_STAT_GPIO, OUTPUT);
+      digitalWrite(CRG_STAT_GPIO, LOW);  // enable charging by default
+      g_charge_enabled = true;
+    #else
+      // Rev4: CRG_STAT is a charge-status input.
+      pinMode(CRG_STAT_GPIO, INPUT_PULLUP);
+    #endif
 
-    fuelGauge.begin();
+    g_battery_init_done = fuelGauge.begin();
+    if (!g_battery_init_done) {
+      Serial.println("Battery fuel gauge init failed.");
+    }
   #else
     // With hardware rev 3 the battery charge status cannot be recognized in a reliable way due to a design flaw in the PCB.
     // See https://github.com/CoretechR/OMOTE/issues/55
     // So charge status is deactivated for now.
     //pinMode(CRG_STAT_GPIO, INPUT_PULLUP);
     pinMode(ADC_BAT_GPIO, INPUT);
+    g_battery_init_done = true;
   #endif
 }
 
 void get_battery_status_HAL(int *battery_voltage, int *battery_percentage, bool *battery_ischarging) {
+  if (battery_voltage == nullptr || battery_percentage == nullptr || battery_ischarging == nullptr) return;
+
   #if (OMOTE_HARDWARE_REV >= 4)
+    if (!g_battery_init_done) {
+      *battery_voltage = 0;
+      *battery_percentage = 0;
+      *battery_ischarging = false;
+      return;
+    }
     // With hardware rev 4, battery state of charge is monitored by a MAX17048 fuel gauge
     *battery_voltage = (int)(fuelGauge.getVoltage()*1000);
     float soc = fuelGauge.getSOC();
     if (soc > 100.0) soc = 100.0;
+    if (soc < 0.0) soc = 0.0;
     *battery_percentage = (int)soc;
-    *battery_ischarging = !digitalRead(CRG_STAT_GPIO);
+    #if (OMOTE_HARDWARE_REV >= 5)
+      // No dedicated TP4056 status pin is routed to MCU on rev5.
+      // Approximate: if charging is enabled and SOC is not yet full.
+      *battery_ischarging = g_charge_enabled && (soc < 99.0f);
+    #else
+      *battery_ischarging = !digitalRead(CRG_STAT_GPIO);
+    #endif
 
     //Serial.print(" LiIon Voltage: ");
     //Serial.print(fuelGauge.getVoltage());  // Print the battery voltage
@@ -63,5 +94,27 @@ void get_battery_status_HAL(int *battery_voltage, int *battery_percentage, bool 
       https://how2electronics.com/lithium-ion-battery-charger-circuit-using-mcp73831/
     */
     //*battery_ischarging = !digitalRead(CRG_STAT_GPIO);
+    *battery_ischarging = false;
+  #endif
+}
+
+bool battery_is_charge_control_available_HAL(void) {
+  #if (OMOTE_HARDWARE_REV >= 5)
+    return true;
+  #else
+    return false;
+  #endif
+}
+
+bool set_battery_charging_enabled_HAL(bool enabled) {
+  #if (OMOTE_HARDWARE_REV >= 5)
+    // TP4056 CE: LOW enables charging, HIGH disables charging.
+    pinMode(CRG_STAT_GPIO, OUTPUT);
+    digitalWrite(CRG_STAT_GPIO, enabled ? LOW : HIGH);
+    g_charge_enabled = enabled;
+    return true;
+  #else
+    (void)enabled;
+    return false;
   #endif
 }
