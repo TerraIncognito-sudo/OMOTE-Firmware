@@ -29,12 +29,32 @@ static constexpr uint8_t kCols = 5;
 rawKeyV2 g_raw_keys[kRows][kCols] = {};
 unsigned long g_charge_protection_timer_ms = 0;
 bool g_charge_cutoff_applied = false;
+unsigned long g_charge_full_since_ms = 0;
+unsigned long g_charge_resume_since_ms = 0;
+bool g_charge_hw_notice_logged = false;
 unsigned long g_activity_check_timer_ms = 0;
 
 namespace {
 constexpr const char* kUiPrefsNs = "omotev2ui";
 constexpr const char* kUiTimezoneKey = "timezone";
 constexpr const char* kDefaultTimezoneValue = "EST5EDT,M3.2.0/2,M11.1.0/2";
+constexpr unsigned long kChargeProtectionIntervalMs = 5000;
+constexpr unsigned long kChargeFullHoldMs = 30000;
+constexpr unsigned long kChargeResumeHoldMs = 15000;
+constexpr int kChargeCutoffPercent = 98;
+constexpr int kChargeResumePercent = 95;
+
+const char* wakeup_reason_text(Wakeup_reasons reason) {
+  switch (reason) {
+    case WAKEUP_BY_IMU:
+      return "motion";
+    case WAKEUP_BY_KEYPAD:
+      return "keypad";
+    case WAKEUP_BY_RESET:
+    default:
+      return "reset";
+  }
+}
 
 void apply_saved_timezone_setting() {
   Preferences prefs;
@@ -74,7 +94,10 @@ void setup() {
   apply_saved_timezone_setting();
 #if (ENABLE_WIFI_AND_MQTT == 1)
   init_mqtt_HAL();
-  configTime(0, 0, "pool.ntp.org", "time.nist.gov", "time.google.com");
+  wifi_request_time_sync_HAL();
+#endif
+#if (ENABLE_KEYBOARD_BLE == 1)
+  init_keyboardBLE_HAL();
 #endif
 
   g_registry.load();
@@ -82,6 +105,9 @@ void setup() {
   static SetupUi ui(g_registry, g_activity_registry, g_dispatcher);
   g_ui = &ui;
   g_ui->init();
+  if (g_ui != nullptr) {
+    g_ui->notify_power_event(std::string("Wake source: ") + wakeup_reason_text(wakeup_reason));
+  }
 }
 
 void loop() {
@@ -91,33 +117,53 @@ void loop() {
 #if (OMOTE_HARDWARE_REV >= 5)
   update_keyboardBrightness_HAL();
 #endif
-  if (millis() - g_charge_protection_timer_ms >= 5000) {
+  if (millis() - g_charge_protection_timer_ms >= kChargeProtectionIntervalMs) {
     g_charge_protection_timer_ms = millis();
     int battery_mv = 0;
     int battery_pct = 0;
     bool battery_charging = false;
     get_battery_status_HAL(&battery_mv, &battery_pct, &battery_charging);
 
-    const bool full = battery_pct >= 98;
-    const bool low_enough_to_resume = battery_pct <= 95;
-    if (full && battery_charging && !g_charge_cutoff_applied) {
-      if (battery_is_charge_control_available_HAL()) {
+    if (battery_mv <= 0) {
+      g_charge_full_since_ms = 0;
+      g_charge_resume_since_ms = 0;
+    } else if (battery_pct >= kChargeCutoffPercent && battery_charging && !g_charge_cutoff_applied) {
+      if (g_charge_full_since_ms == 0) g_charge_full_since_ms = millis();
+      g_charge_resume_since_ms = 0;
+      if (millis() - g_charge_full_since_ms < kChargeFullHoldMs) {
+        // Require stable "full" state to avoid toggling on noisy SOC updates.
+      } else if (battery_is_charge_control_available_HAL()) {
         if (set_battery_charging_enabled_HAL(false)) {
           g_charge_cutoff_applied = true;
-          Serial.println("Charge protection: USB charging disabled (battery full).");
+          g_charge_full_since_ms = 0;
+          Serial.println("Charge protection: USB charging disabled (battery full/stable).");
+          if (g_ui != nullptr) g_ui->notify_power_event("Charge protection: charging paused at full battery");
         }
-      } else {
+      } else if (!g_charge_hw_notice_logged) {
         Serial.println("Charge protection: full battery detected. Hardware auto-termination in use.");
-        g_charge_cutoff_applied = true;
+        g_charge_hw_notice_logged = true;
       }
-    } else if (g_charge_cutoff_applied && low_enough_to_resume) {
-      if (battery_is_charge_control_available_HAL()) {
+    } else if (g_charge_cutoff_applied && battery_pct <= kChargeResumePercent) {
+      if (g_charge_resume_since_ms == 0) g_charge_resume_since_ms = millis();
+      g_charge_full_since_ms = 0;
+      if (millis() - g_charge_resume_since_ms < kChargeResumeHoldMs) {
+        // Hold before re-enabling charging.
+      } else if (battery_is_charge_control_available_HAL()) {
         if (set_battery_charging_enabled_HAL(true)) {
           Serial.println("Charge protection: USB charging re-enabled.");
           g_charge_cutoff_applied = false;
+          g_charge_resume_since_ms = 0;
+          if (g_ui != nullptr) g_ui->notify_power_event("Charge protection: charging resumed");
         }
       } else {
         g_charge_cutoff_applied = false;
+        g_charge_resume_since_ms = 0;
+      }
+    } else {
+      g_charge_full_since_ms = 0;
+      if (!g_charge_cutoff_applied) g_charge_resume_since_ms = 0;
+      if (battery_pct <= (kChargeResumePercent - 2)) {
+        g_charge_hw_notice_logged = false;
       }
     }
   }

@@ -2,7 +2,9 @@
 
 #include <Arduino.h>
 #include <algorithm>
+#include <cctype>
 #include <cerrno>
+#include <climits>
 #include <cstdint>
 #include <cstdlib>
 #include <ctime>
@@ -31,6 +33,9 @@ const char* kCommandSlotOptions = "Power\nVolume Up\nVolume Down\nMute\nUp\nDown
 constexpr time_t kMinValidClockEpoch = 1704067200;  // 2024-01-01 00:00:00 UTC
 constexpr const char* kUiPrefsNs = "omotev2ui";
 constexpr const char* kUiTimezoneKey = "timezone";
+constexpr const char* kUiDebounceIntervalKey = "debounce_ms";
+constexpr const char* kUiSelectedActivityIdKey = "sel_act_id";
+constexpr const char* kUiSelectedTabKey = "sel_tab";
 constexpr const char* kDefaultTimezoneValue = "EST5EDT,M3.2.0/2,M11.1.0/2";
 SetupUi* g_active_ui = nullptr;
 
@@ -83,12 +88,76 @@ const PhysicalKeyDef kPhysicalKeys[] = {
 
 constexpr size_t kPhysicalKeyCount = sizeof(kPhysicalKeys) / sizeof(kPhysicalKeys[0]);
 
+struct SleepTimeoutOption {
+  const char* label;
+  uint32_t timeout_ms;
+};
+
+const SleepTimeoutOption kSleepTimeoutOptions[] = {
+    {"20 sec", 20000},
+    {"1 min", 60000},
+    {"3 min", 180000},
+    {"10 min", 600000},
+    {"30 min", 1800000},
+};
+
+constexpr size_t kSleepTimeoutOptionCount = sizeof(kSleepTimeoutOptions) / sizeof(kSleepTimeoutOptions[0]);
+
+struct DebounceOption {
+  const char* label;
+  unsigned long interval_ms;
+};
+
+const DebounceOption kDebounceOptions[] = {
+    {"Off", 0},
+    {"80 ms", 80},
+    {"140 ms", 140},
+    {"250 ms", 250},
+    {"400 ms", 400},
+    {"750 ms", 750},
+};
+
+constexpr size_t kDebounceOptionCount = sizeof(kDebounceOptions) / sizeof(kDebounceOptions[0]);
+
+struct MqttTemplateDef {
+  const char* label;
+  const char* command_name;
+  const char* topic_suffix;
+  const char* payload;
+};
+
+const MqttTemplateDef kMqttTemplates[] = {
+    {"Select template", "", "", ""},
+    {"Power Toggle", "Power", "POWER", "TOGGLE"},
+    {"Power On", "Power", "POWER", "ON"},
+    {"Power Off", "Power", "POWER", "OFF"},
+    {"Volume Up", "Volume Up", "VOLUME", "UP"},
+    {"Volume Down", "Volume Down", "VOLUME", "DOWN"},
+    {"Mute Toggle", "Mute", "MUTE", "TOGGLE"},
+    {"Navigate Up", "Up", "NAV", "UP"},
+    {"Navigate Down", "Down", "NAV", "DOWN"},
+    {"Navigate Left", "Left", "NAV", "LEFT"},
+    {"Navigate Right", "Right", "NAV", "RIGHT"},
+    {"Select OK", "OK", "NAV", "OK"},
+    {"Back", "Back", "NAV", "BACK"},
+    {"Home", "Home", "NAV", "HOME"},
+};
+
+constexpr size_t kMqttTemplateCount = sizeof(kMqttTemplates) / sizeof(kMqttTemplates[0]);
+
 std::string trim_copy(const std::string& in) {
   size_t start = 0;
   while (start < in.size() && (in[start] == ' ' || in[start] == '\t')) ++start;
   size_t end = in.size();
   while (end > start && (in[end - 1] == ' ' || in[end - 1] == '\t')) --end;
   return in.substr(start, end - start);
+}
+
+std::string lower_copy(const std::string& in) {
+  std::string out = in;
+  std::transform(out.begin(), out.end(), out.begin(),
+                 [](unsigned char c) { return static_cast<char>(tolower(c)); });
+  return out;
 }
 
 bool parse_u64_token(const std::string& token) {
@@ -133,6 +202,83 @@ const char* timezone_label_for_index(uint16_t index) {
   return kTimeZoneOptions[index].label;
 }
 
+std::string sleep_timeout_dropdown_options() {
+  std::string options;
+  for (size_t i = 0; i < kSleepTimeoutOptionCount; ++i) {
+    if (!options.empty()) options += "\n";
+    options += kSleepTimeoutOptions[i].label;
+  }
+  return options;
+}
+
+uint16_t sleep_timeout_index_for_value(uint32_t timeout_ms) {
+  for (uint16_t i = 0; i < kSleepTimeoutOptionCount; ++i) {
+    if (kSleepTimeoutOptions[i].timeout_ms == timeout_ms) return i;
+  }
+  // Choose nearest by absolute distance if no exact match.
+  uint16_t nearest = 0;
+  uint32_t best_delta = UINT32_MAX;
+  for (uint16_t i = 0; i < kSleepTimeoutOptionCount; ++i) {
+    uint32_t option_ms = kSleepTimeoutOptions[i].timeout_ms;
+    uint32_t delta = option_ms > timeout_ms ? (option_ms - timeout_ms) : (timeout_ms - option_ms);
+    if (delta < best_delta) {
+      best_delta = delta;
+      nearest = i;
+    }
+  }
+  return nearest;
+}
+
+uint32_t sleep_timeout_value_for_index(uint16_t index) {
+  if (index >= kSleepTimeoutOptionCount) return kSleepTimeoutOptions[0].timeout_ms;
+  return kSleepTimeoutOptions[index].timeout_ms;
+}
+
+std::string debounce_dropdown_options() {
+  std::string options;
+  for (size_t i = 0; i < kDebounceOptionCount; ++i) {
+    if (!options.empty()) options += "\n";
+    options += kDebounceOptions[i].label;
+  }
+  return options;
+}
+
+uint16_t debounce_index_for_value(unsigned long interval_ms) {
+  for (uint16_t i = 0; i < kDebounceOptionCount; ++i) {
+    if (kDebounceOptions[i].interval_ms == interval_ms) return i;
+  }
+  uint16_t nearest = 0;
+  unsigned long best_delta = ULONG_MAX;
+  for (uint16_t i = 0; i < kDebounceOptionCount; ++i) {
+    unsigned long option_ms = kDebounceOptions[i].interval_ms;
+    unsigned long delta = option_ms > interval_ms ? (option_ms - interval_ms) : (interval_ms - option_ms);
+    if (delta < best_delta) {
+      best_delta = delta;
+      nearest = i;
+    }
+  }
+  return nearest;
+}
+
+unsigned long debounce_value_for_index(uint16_t index) {
+  if (index >= kDebounceOptionCount) return kDebounceOptions[2].interval_ms;
+  return kDebounceOptions[index].interval_ms;
+}
+
+std::string mqtt_template_dropdown_options() {
+  std::string options;
+  for (size_t i = 0; i < kMqttTemplateCount; ++i) {
+    if (!options.empty()) options += "\n";
+    options += kMqttTemplates[i].label;
+  }
+  return options;
+}
+
+const MqttTemplateDef* mqtt_template_for_index(uint16_t index) {
+  if (index >= kMqttTemplateCount) return nullptr;
+  return &kMqttTemplates[index];
+}
+
 void apply_timezone_setting(const std::string& timezone_value) {
   const std::string tz = timezone_value.empty() ? std::string(kDefaultTimezoneValue) : timezone_value;
   setenv("TZ", tz.c_str(), 1);
@@ -159,28 +305,160 @@ bool save_timezone_setting(const std::string& timezone_value) {
   return true;
 }
 
+unsigned long load_debounce_interval_setting(unsigned long fallback_ms) {
+  Preferences prefs;
+  unsigned long debounce_ms = fallback_ms;
+  if (prefs.begin(kUiPrefsNs, true)) {
+    debounce_ms = prefs.getULong(kUiDebounceIntervalKey, fallback_ms);
+    prefs.end();
+  }
+  return debounce_ms;
+}
+
+bool save_debounce_interval_setting(unsigned long interval_ms) {
+  Preferences prefs;
+  if (!prefs.begin(kUiPrefsNs, false)) return false;
+  prefs.putULong(kUiDebounceIntervalKey, interval_ms);
+  prefs.end();
+  return true;
+}
+
 bool starts_with(const std::string& text, const char* prefix) {
   if (prefix == nullptr) return false;
   return text.rfind(prefix, 0) == 0;
 }
 
-bool is_valid_ir_payload(const std::string& raw_payload) {
+bool validate_ir_payload(const std::string& raw_payload, std::string* error_detail) {
   std::string payload = trim_copy(raw_payload);
-  if (payload.empty()) return true;  // empty means "not mapped"
+  if (payload.empty()) return true;
 
   size_t first_colon = payload.find(':');
   if (first_colon == std::string::npos) {
-    return parse_u64_token(payload);  // data only, defaults for bits/repeat
+    if (parse_u64_token(payload)) return true;
+    if (error_detail != nullptr) {
+      *error_detail = "data must be an integer/hex value";
+    }
+    return false;
   }
 
   size_t second_colon = payload.find(':', first_colon + 1);
-  if (second_colon == std::string::npos) return false;
-  if (payload.find(':', second_colon + 1) != std::string::npos) return false;
+  if (second_colon == std::string::npos) {
+    if (error_detail != nullptr) {
+      *error_detail = "use data:bits:repeat";
+    }
+    return false;
+  }
+  if (payload.find(':', second_colon + 1) != std::string::npos) {
+    if (error_detail != nullptr) {
+      *error_detail = "too many ':' separators";
+    }
+    return false;
+  }
 
-  std::string data = payload.substr(0, first_colon);
-  std::string bits = payload.substr(first_colon + 1, second_colon - first_colon - 1);
-  std::string repeat = payload.substr(second_colon + 1);
-  return parse_u64_token(trim_copy(data)) && parse_u32_token(trim_copy(bits)) && parse_u32_token(trim_copy(repeat));
+  const std::string data = trim_copy(payload.substr(0, first_colon));
+  const std::string bits = trim_copy(payload.substr(first_colon + 1, second_colon - first_colon - 1));
+  const std::string repeat = trim_copy(payload.substr(second_colon + 1));
+
+  if (!parse_u64_token(data)) {
+    if (error_detail != nullptr) {
+      *error_detail = "data token is invalid";
+    }
+    return false;
+  }
+  if (!parse_u32_token(bits)) {
+    if (error_detail != nullptr) {
+      *error_detail = "bits token is invalid";
+    }
+    return false;
+  }
+  if (!parse_u32_token(repeat)) {
+    if (error_detail != nullptr) {
+      *error_detail = "repeat token is invalid";
+    }
+    return false;
+  }
+
+  return true;
+}
+
+bool validate_mqtt_payload(const std::string& raw_payload, const std::string& default_topic, std::string* error_detail) {
+  const std::string payload = trim_copy(raw_payload);
+  if (payload.empty()) {
+    if (error_detail != nullptr) *error_detail = "payload is empty";
+    return false;
+  }
+
+  std::string topic;
+  const size_t newline_pos = payload.find('\n');
+  const size_t pipe_pos = payload.find('|');
+  if (newline_pos != std::string::npos) {
+    topic = trim_copy(payload.substr(0, newline_pos));
+  } else if (pipe_pos != std::string::npos) {
+    topic = trim_copy(payload.substr(0, pipe_pos));
+  } else {
+    topic = trim_copy(default_topic);
+  }
+
+  if (topic.empty()) {
+    if (error_detail != nullptr) {
+      *error_detail = "missing topic (use topic|payload or set device topic)";
+    }
+    return false;
+  }
+  return true;
+}
+
+bool validate_ble_payload(const std::string& raw_payload, std::string* error_detail) {
+  const std::string payload = trim_copy(raw_payload);
+  if (payload.empty()) {
+    if (error_detail != nullptr) *error_detail = "payload is empty";
+    return false;
+  }
+
+  std::string body = payload;
+  const size_t at_pos = payload.find('@');
+  if (at_pos != std::string::npos) {
+    const std::string address = trim_copy(payload.substr(0, at_pos));
+    if (address.empty()) {
+      if (error_detail != nullptr) *error_detail = "address before '@' is empty";
+      return false;
+    }
+    body = trim_copy(payload.substr(at_pos + 1));
+  }
+
+  const size_t colon = body.find(':');
+  if (colon == std::string::npos) {
+    if (error_detail != nullptr) *error_detail = "use key:<name>, media:<name>, or text:<value>";
+    return false;
+  }
+  const std::string kind = lower_copy(trim_copy(body.substr(0, colon)));
+  const std::string value = lower_copy(trim_copy(body.substr(colon + 1)));
+  if (value.empty()) {
+    if (error_detail != nullptr) *error_detail = "payload value is empty";
+    return false;
+  }
+  if (kind == "text") return true;
+
+  if (kind == "key") {
+    static const char* kAllowed[] = {"up", "down", "left", "right", "ok", "enter", "back", "home", "menu"};
+    for (const char* token : kAllowed) {
+      if (value == token) return true;
+    }
+    if (error_detail != nullptr) *error_detail = "unknown key action";
+    return false;
+  }
+  if (kind == "media") {
+    static const char* kAllowed[] = {"back", "home", "prev", "rewind", "rewind_long", "playpause",
+                                      "ff", "ff_long", "next", "mute", "volup", "voldown"};
+    for (const char* token : kAllowed) {
+      if (value == token) return true;
+    }
+    if (error_detail != nullptr) *error_detail = "unknown media action";
+    return false;
+  }
+
+  if (error_detail != nullptr) *error_detail = "unknown BLE payload type";
+  return false;
 }
 
 bool get_valid_local_time(struct tm* out_tm) {
@@ -257,6 +535,8 @@ void SetupUi::init() {
     (void)device_registry_.replace_all(std::move(normalized_devices));
     (void)activity_registry_.replace_all(std::move(normalized_activities));
   }
+  const unsigned long saved_debounce_ms = load_debounce_interval_setting(dispatcher_.debounce_interval_ms());
+  dispatcher_.set_debounce_interval_ms(saved_debounce_ms);
 
   root_ = lv_scr_act();
   lv_obj_clear_flag(root_, LV_OBJ_FLAG_SCROLLABLE);
@@ -291,6 +571,7 @@ void SetupUi::init() {
   lv_obj_align(tabview_, LV_ALIGN_TOP_MID, 0, 18);
   lv_obj_clear_flag(tabview_, LV_OBJ_FLAG_SCROLL_ELASTIC);
   lv_obj_set_scrollbar_mode(tabview_, LV_SCROLLBAR_MODE_OFF);
+  lv_obj_add_event_cb(tabview_, on_tabview_changed, LV_EVENT_VALUE_CHANGED, this);
 
   // Linear order: Devices -> Activities -> Remote -> Settings
   devices_page_ = lv_tileview_add_tile(tabview_, 0, 0, LV_DIR_RIGHT);
@@ -306,14 +587,19 @@ void SetupUi::init() {
   rebuild_device_list();
   rebuild_activity_list();
   rebuild_remote_activity_dropdown();
+  rebuild_remote_command_buttons();
+  restore_ui_context();
   update_status_bar();
-  lv_obj_set_tile(tabview_, activities_page_, LV_ANIM_OFF);
+  if (lv_tileview_get_tile_act(tabview_) == nullptr) {
+    lv_obj_set_tile(tabview_, activities_page_, LV_ANIM_OFF);
+  }
 }
 
 void SetupUi::tick() {
   if (millis() - last_status_update_ms_ >= 1000) {
     last_status_update_ms_ = millis();
     update_status_bar();
+    refresh_ble_modal_status();
   }
   if (ir_learning_active_) {
     infraredReceiver_loop_HAL();
@@ -321,15 +607,100 @@ void SetupUi::tick() {
   lv_timer_handler();
 }
 
+void SetupUi::notify_power_event(const std::string& message) {
+  last_power_event_ = message;
+  if (settings_status_ != nullptr) {
+    lv_label_set_text(settings_status_, message.c_str());
+  }
+}
+
+void SetupUi::save_ui_context() {
+  Preferences prefs;
+  if (!prefs.begin(kUiPrefsNs, false)) return;
+
+  const std::vector<ActivityRecord>& activities = activity_registry_.all();
+  uint32_t selected_activity_id = 0;
+  if (selected_activity_index_ >= 0 && selected_activity_index_ < static_cast<int>(activities.size())) {
+    selected_activity_id = activities[selected_activity_index_].id;
+  }
+  prefs.putUInt(kUiSelectedActivityIdKey, selected_activity_id);
+
+  uint8_t selected_tab = 1;
+  if (tabview_ != nullptr) {
+    lv_obj_t* active_tile = lv_tileview_get_tile_act(tabview_);
+    if (active_tile == devices_page_) {
+      selected_tab = 0;
+    } else if (active_tile == activities_page_) {
+      selected_tab = 1;
+    } else if (active_tile == remote_page_) {
+      selected_tab = 2;
+    } else if (active_tile == settings_page_) {
+      selected_tab = 3;
+    }
+  }
+  const uint32_t saved_activity_id = prefs.getUInt(kUiSelectedActivityIdKey, UINT32_MAX);
+  const uint8_t saved_tab = prefs.getUChar(kUiSelectedTabKey, 0xFF);
+  if (saved_activity_id != selected_activity_id) {
+    prefs.putUInt(kUiSelectedActivityIdKey, selected_activity_id);
+  }
+  if (saved_tab != selected_tab) {
+    prefs.putUChar(kUiSelectedTabKey, selected_tab);
+  }
+  prefs.end();
+}
+
+void SetupUi::restore_ui_context() {
+  uint32_t selected_activity_id = 0;
+  uint8_t selected_tab = 1;
+  Preferences prefs;
+  if (prefs.begin(kUiPrefsNs, true)) {
+    selected_activity_id = prefs.getUInt(kUiSelectedActivityIdKey, 0);
+    selected_tab = prefs.getUChar(kUiSelectedTabKey, 1);
+    prefs.end();
+  }
+
+  if (selected_activity_id != 0) {
+    const std::vector<ActivityRecord>& activities = activity_registry_.all();
+    for (size_t i = 0; i < activities.size(); ++i) {
+      if (activities[i].id == selected_activity_id) {
+        selected_activity_index_ = static_cast<int>(i);
+        break;
+      }
+    }
+  }
+  rebuild_activity_list();
+  rebuild_remote_activity_dropdown();
+
+  if (tabview_ != nullptr) {
+    lv_obj_t* target_tile = activities_page_;
+    if (selected_tab == 0 && devices_page_ != nullptr) target_tile = devices_page_;
+    if (selected_tab == 1 && activities_page_ != nullptr) target_tile = activities_page_;
+    if (selected_tab == 2 && remote_page_ != nullptr) target_tile = remote_page_;
+    if (selected_tab == 3 && settings_page_ != nullptr) target_tile = settings_page_;
+    lv_obj_set_tile(tabview_, target_tile, LV_ANIM_OFF);
+  }
+}
+
 void SetupUi::update_status_bar() {
   bool wifi_connected = false;
+  bool mqtt_configured = false;
+  bool mqtt_connected = false;
 #if (ENABLE_WIFI_AND_MQTT == 1)
   wifi_connected = getIsWifiConnected_HAL();
+  mqtt_configured = mqtt_is_configured_HAL();
+  mqtt_connected = mqtt_is_connected_HAL();
 #endif
-  lv_label_set_text(wifi_status_label_, "WiFi");
-  lv_obj_set_style_text_color(wifi_status_label_,
-                              wifi_connected ? lv_color_hex(0x3EDC81) : lv_color_hex(0xE2574C),
-                              LV_PART_MAIN);
+  if (wifi_connected && mqtt_configured) {
+    lv_label_set_text(wifi_status_label_, mqtt_connected ? "WiFi+M" : "WiFi~M");
+    lv_obj_set_style_text_color(wifi_status_label_,
+                                mqtt_connected ? lv_color_hex(0x3EDC81) : lv_color_hex(0xE6B450),
+                                LV_PART_MAIN);
+  } else {
+    lv_label_set_text(wifi_status_label_, "WiFi");
+    lv_obj_set_style_text_color(wifi_status_label_,
+                                wifi_connected ? lv_color_hex(0x3EDC81) : lv_color_hex(0xE2574C),
+                                LV_PART_MAIN);
+  }
   if (time_status_label_ != nullptr) {
     const std::string time_text = current_time_hhmm_text();
     lv_label_set_text(time_status_label_, time_text.c_str());
@@ -342,11 +713,12 @@ void SetupUi::update_status_bar() {
     if (wifi_connect_attempt_active_) {
       if (wifi_connected) {
         wifi_connect_attempt_active_ = false;
+        wifi_request_time_sync_HAL();
         if (settings_status_ != nullptr) {
           if (wifi_connect_target_ssid_.empty()) {
-            lv_label_set_text(settings_status_, "WiFi connected");
+            lv_label_set_text(settings_status_, "WiFi connected, syncing time...");
           } else {
-            lv_label_set_text_fmt(settings_status_, "WiFi connected: %s", wifi_connect_target_ssid_.c_str());
+            lv_label_set_text_fmt(settings_status_, "WiFi connected: %s (syncing time...)", wifi_connect_target_ssid_.c_str());
           }
         }
       } else if (millis() - wifi_connect_attempt_started_ms_ > 20000) {
@@ -370,12 +742,18 @@ void SetupUi::update_status_bar() {
   get_battery_status_HAL(&battery_mv, &battery_pct, &battery_charging);
   if (battery_mv <= 0) {
     lv_label_set_text(battery_status_label_, "Batt: --");
+    lv_obj_set_style_text_color(battery_status_label_, lv_color_hex(0xBBBBBB), LV_PART_MAIN);
     return;
   }
   if (battery_charging) {
     lv_label_set_text_fmt(battery_status_label_, "Batt: %d%%+", battery_pct);
+    lv_obj_set_style_text_color(battery_status_label_, lv_color_hex(0x3EDC81), LV_PART_MAIN);
+  } else if (battery_is_charge_control_available_HAL() && battery_pct >= 98) {
+    lv_label_set_text_fmt(battery_status_label_, "Batt: %d%%=", battery_pct);
+    lv_obj_set_style_text_color(battery_status_label_, lv_color_hex(0xE6B450), LV_PART_MAIN);
   } else {
     lv_label_set_text_fmt(battery_status_label_, "Batt: %d%%", battery_pct);
+    lv_obj_set_style_text_color(battery_status_label_, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
   }
 }
 
@@ -386,12 +764,41 @@ void SetupUi::build_devices_tab() {
   lv_obj_set_style_pad_all(tab, 6, LV_PART_MAIN);
   const int tab_w = SCR_WIDTH - 12;
   const int footer_h = 34;
+  const int reorder_h = 24;
+  const int reorder_gap = 4;
   const int list_top = 38;
-  const int list_h = SCR_HEIGHT - 44 - list_top - footer_h - 16;
+  const int list_h = SCR_HEIGHT - 44 - list_top - footer_h - reorder_h - reorder_gap - 16;
 
   lv_obj_t* title = lv_label_create(tab);
   lv_label_set_text(title, "Devices");
   lv_obj_align(title, LV_ALIGN_TOP_LEFT, 0, 0);
+
+  device_move_up_btn_ = lv_btn_create(tab);
+  lv_obj_set_size(device_move_up_btn_, (tab_w - 8) / 3, reorder_h);
+  lv_obj_align(device_move_up_btn_, LV_ALIGN_BOTTOM_LEFT, 0, -(footer_h + reorder_gap));
+  lv_obj_add_event_cb(device_move_up_btn_, on_device_move_up_clicked, LV_EVENT_CLICKED, this);
+  lv_obj_t* up_label = lv_label_create(device_move_up_btn_);
+  lv_label_set_text(up_label, "Up");
+  lv_obj_set_style_text_font(up_label, &lv_font_montserrat_10, LV_PART_MAIN);
+  lv_obj_center(up_label);
+
+  device_move_down_btn_ = lv_btn_create(tab);
+  lv_obj_set_size(device_move_down_btn_, (tab_w - 8) / 3, reorder_h);
+  lv_obj_align(device_move_down_btn_, LV_ALIGN_BOTTOM_MID, 0, -(footer_h + reorder_gap));
+  lv_obj_add_event_cb(device_move_down_btn_, on_device_move_down_clicked, LV_EVENT_CLICKED, this);
+  lv_obj_t* down_label = lv_label_create(device_move_down_btn_);
+  lv_label_set_text(down_label, "Down");
+  lv_obj_set_style_text_font(down_label, &lv_font_montserrat_10, LV_PART_MAIN);
+  lv_obj_center(down_label);
+
+  device_duplicate_btn_ = lv_btn_create(tab);
+  lv_obj_set_size(device_duplicate_btn_, (tab_w - 8) / 3, reorder_h);
+  lv_obj_align(device_duplicate_btn_, LV_ALIGN_BOTTOM_RIGHT, 0, -(footer_h + reorder_gap));
+  lv_obj_add_event_cb(device_duplicate_btn_, on_device_duplicate_clicked, LV_EVENT_CLICKED, this);
+  lv_obj_t* dup_label = lv_label_create(device_duplicate_btn_);
+  lv_label_set_text(dup_label, "Dup");
+  lv_obj_set_style_text_font(dup_label, &lv_font_montserrat_10, LV_PART_MAIN);
+  lv_obj_center(dup_label);
 
   selected_device_label_ = lv_label_create(tab);
   lv_label_set_text(selected_device_label_, "Selected: none");
@@ -446,12 +853,41 @@ void SetupUi::build_activities_tab() {
   lv_obj_set_style_pad_all(tab, 6, LV_PART_MAIN);
   const int tab_w = SCR_WIDTH - 12;
   const int footer_h = 34;
+  const int reorder_h = 24;
+  const int reorder_gap = 4;
   const int list_top = 44;
-  const int list_h = SCR_HEIGHT - 44 - list_top - footer_h - 16;
+  const int list_h = SCR_HEIGHT - 44 - list_top - footer_h - reorder_h - reorder_gap - 16;
 
   lv_obj_t* title = lv_label_create(tab);
   lv_label_set_text(title, "Activities");
   lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 0);
+
+  activity_move_up_btn_ = lv_btn_create(tab);
+  lv_obj_set_size(activity_move_up_btn_, (tab_w - 8) / 3, reorder_h);
+  lv_obj_align(activity_move_up_btn_, LV_ALIGN_BOTTOM_LEFT, 0, -(footer_h + reorder_gap));
+  lv_obj_add_event_cb(activity_move_up_btn_, on_activity_move_up_clicked, LV_EVENT_CLICKED, this);
+  lv_obj_t* aup_label = lv_label_create(activity_move_up_btn_);
+  lv_label_set_text(aup_label, "Up");
+  lv_obj_set_style_text_font(aup_label, &lv_font_montserrat_10, LV_PART_MAIN);
+  lv_obj_center(aup_label);
+
+  activity_move_down_btn_ = lv_btn_create(tab);
+  lv_obj_set_size(activity_move_down_btn_, (tab_w - 8) / 3, reorder_h);
+  lv_obj_align(activity_move_down_btn_, LV_ALIGN_BOTTOM_MID, 0, -(footer_h + reorder_gap));
+  lv_obj_add_event_cb(activity_move_down_btn_, on_activity_move_down_clicked, LV_EVENT_CLICKED, this);
+  lv_obj_t* adown_label = lv_label_create(activity_move_down_btn_);
+  lv_label_set_text(adown_label, "Down");
+  lv_obj_set_style_text_font(adown_label, &lv_font_montserrat_10, LV_PART_MAIN);
+  lv_obj_center(adown_label);
+
+  activity_duplicate_btn_ = lv_btn_create(tab);
+  lv_obj_set_size(activity_duplicate_btn_, (tab_w - 8) / 3, reorder_h);
+  lv_obj_align(activity_duplicate_btn_, LV_ALIGN_BOTTOM_RIGHT, 0, -(footer_h + reorder_gap));
+  lv_obj_add_event_cb(activity_duplicate_btn_, on_activity_duplicate_clicked, LV_EVENT_CLICKED, this);
+  lv_obj_t* adup_label = lv_label_create(activity_duplicate_btn_);
+  lv_label_set_text(adup_label, "Dup");
+  lv_obj_set_style_text_font(adup_label, &lv_font_montserrat_10, LV_PART_MAIN);
+  lv_obj_center(adup_label);
 
   activity_builder_btn_ = lv_btn_create(tab);
   lv_obj_set_size(activity_builder_btn_, 64, 24);
@@ -503,7 +939,7 @@ void SetupUi::build_activities_tab() {
   lv_obj_align(activity_keymap_btn_, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
   lv_obj_add_event_cb(activity_keymap_btn_, on_activity_keymap_open, LV_EVENT_CLICKED, this);
   lv_obj_t* keymap_label = lv_label_create(activity_keymap_btn_);
-  lv_label_set_text(keymap_label, "Keymap");
+  lv_label_set_text(keymap_label, "Edit");
   lv_obj_set_style_text_font(keymap_label, &lv_font_montserrat_10, LV_PART_MAIN);
   lv_obj_center(keymap_label);
 }
@@ -511,18 +947,17 @@ void SetupUi::build_activities_tab() {
 void SetupUi::build_remote_tab() {
   lv_obj_t* tab = remote_page_;
   if (tab == nullptr) return;
-  lv_obj_clear_flag(tab, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(tab, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_scroll_dir(tab, LV_DIR_VER);
   lv_obj_set_style_pad_all(tab, 6, LV_PART_MAIN);
-  const int pad = 4;
-  const int btn_w = (SCR_WIDTH - 12 - (2 * pad)) / 3;
-  const int btn_h = 30;
+  lv_obj_set_style_pad_bottom(tab, 10, LV_PART_MAIN);
 
   lv_obj_t* title = lv_label_create(tab);
   lv_label_set_text(title, "Remote");
   lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 0);
 
   lv_obj_t* dd_label = lv_label_create(tab);
-  lv_label_set_text(dd_label, "Activity");
+  lv_label_set_text(dd_label, "Device");
   lv_obj_align(dd_label, LV_ALIGN_TOP_LEFT, 0, 14);
 
   remote_activity_dd_ = lv_dropdown_create(tab);
@@ -531,95 +966,112 @@ void SetupUi::build_remote_tab() {
   lv_obj_add_event_cb(remote_activity_dd_, on_remote_activity_changed, LV_EVENT_VALUE_CHANGED, this);
 
   remote_status_ = lv_label_create(tab);
-  lv_label_set_text(remote_status_, "Ready");
+  lv_label_set_text(remote_status_, "Select a device");
   lv_obj_align(remote_status_, LV_ALIGN_TOP_LEFT, 0, 62);
 
-  auto add_cmd_btn = [&](const char* text, int x, int y, CommandSlot slot) {
-    lv_obj_t* btn = lv_btn_create(tab);
-    lv_obj_set_size(btn, btn_w, btn_h);
-    lv_obj_align(btn, LV_ALIGN_TOP_LEFT, x, y);
-    lv_obj_t* label = lv_label_create(btn);
-    lv_label_set_text(label, text);
-    lv_obj_center(label);
-    lv_obj_add_event_cb(btn, on_remote_command_clicked, LV_EVENT_CLICKED, this);
-    lv_obj_set_user_data(btn, reinterpret_cast<void*>(static_cast<intptr_t>(slot)));
-  };
+  remote_page_prev_btn_ = lv_btn_create(tab);
+  lv_obj_set_size(remote_page_prev_btn_, 40, 20);
+  lv_obj_align(remote_page_prev_btn_, LV_ALIGN_TOP_LEFT, 0, 84);
+  lv_obj_add_event_cb(remote_page_prev_btn_, on_remote_page_prev, LV_EVENT_CLICKED, this);
+  lv_obj_t* prev_text = lv_label_create(remote_page_prev_btn_);
+  lv_label_set_text(prev_text, "<");
+  lv_obj_center(prev_text);
 
-  const int x0 = 0;
-  const int x1 = btn_w + pad;
-  const int x2 = x1 + btn_w + pad;
-  const int y0 = 84;
-  const int y1 = y0 + btn_h + pad;
-  const int y2 = y1 + btn_h + pad;
-  const int y3 = y2 + btn_h + pad;
-  const int y4 = y3 + btn_h + pad;
+  remote_page_next_btn_ = lv_btn_create(tab);
+  lv_obj_set_size(remote_page_next_btn_, 40, 20);
+  lv_obj_align(remote_page_next_btn_, LV_ALIGN_TOP_RIGHT, 0, 84);
+  lv_obj_add_event_cb(remote_page_next_btn_, on_remote_page_next, LV_EVENT_CLICKED, this);
+  lv_obj_t* next_text = lv_label_create(remote_page_next_btn_);
+  lv_label_set_text(next_text, ">");
+  lv_obj_center(next_text);
 
-  add_cmd_btn("Power", x0, y0, CommandSlot::Power);
-  add_cmd_btn("Mute", x1, y0, CommandSlot::Mute);
-  add_cmd_btn("Home", x2, y0, CommandSlot::Home);
-
-  add_cmd_btn("Up", x1, y1, CommandSlot::Up);
-  add_cmd_btn("Left", x0, y2, CommandSlot::Left);
-  add_cmd_btn("OK", x1, y2, CommandSlot::Ok);
-  add_cmd_btn("Right", x2, y2, CommandSlot::Right);
-  add_cmd_btn("Down", x1, y3, CommandSlot::Down);
-
-  add_cmd_btn("Vol+", x0, y4, CommandSlot::VolumeUp);
-  add_cmd_btn("Vol-", x1, y4, CommandSlot::VolumeDown);
-  add_cmd_btn("Back", x2, y4, CommandSlot::Back);
+  remote_page_label_ = lv_label_create(tab);
+  lv_label_set_text(remote_page_label_, "Page 1/1");
+  lv_obj_align(remote_page_label_, LV_ALIGN_TOP_MID, 0, 88);
 }
 
 void SetupUi::build_settings_tab() {
   lv_obj_t* tab = settings_page_;
   if (tab == nullptr) return;
-  lv_obj_clear_flag(tab, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(tab, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_scroll_dir(tab, LV_DIR_VER);
+  lv_obj_set_scrollbar_mode(tab, LV_SCROLLBAR_MODE_AUTO);
   lv_obj_set_style_pad_all(tab, 8, LV_PART_MAIN);
+  lv_obj_set_style_pad_bottom(tab, 28, LV_PART_MAIN);
+  const int btn_h = 34;
 
   lv_obj_t* title = lv_label_create(tab);
   lv_label_set_text(title, "Settings");
   lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 0);
 
-  lv_obj_t* help = lv_label_create(tab);
-  lv_label_set_text(help, "Storage and recovery");
-  lv_obj_align(help, LV_ALIGN_TOP_LEFT, 0, 20);
-
   settings_backup_btn_ = lv_btn_create(tab);
-  lv_obj_set_size(settings_backup_btn_, SCR_WIDTH - 16, 38);
+  lv_obj_set_size(settings_backup_btn_, SCR_WIDTH - 16, btn_h);
   lv_obj_align(settings_backup_btn_, LV_ALIGN_TOP_LEFT, 0, 46);
+  lv_obj_add_flag(settings_backup_btn_, LV_OBJ_FLAG_SCROLL_CHAIN_VER);
   lv_obj_add_event_cb(settings_backup_btn_, on_settings_backup_clicked, LV_EVENT_CLICKED, this);
   lv_obj_t* backup_label = lv_label_create(settings_backup_btn_);
   lv_label_set_text(backup_label, "Backup to SD");
   lv_obj_center(backup_label);
 
   settings_restore_btn_ = lv_btn_create(tab);
-  lv_obj_set_size(settings_restore_btn_, SCR_WIDTH - 16, 38);
-  lv_obj_align(settings_restore_btn_, LV_ALIGN_TOP_LEFT, 0, 90);
+  lv_obj_set_size(settings_restore_btn_, SCR_WIDTH - 16, btn_h);
+  lv_obj_align(settings_restore_btn_, LV_ALIGN_TOP_LEFT, 0, 86);
+  lv_obj_add_flag(settings_restore_btn_, LV_OBJ_FLAG_SCROLL_CHAIN_VER);
   lv_obj_add_event_cb(settings_restore_btn_, on_settings_restore_clicked, LV_EVENT_CLICKED, this);
   lv_obj_t* restore_label = lv_label_create(settings_restore_btn_);
   lv_label_set_text(restore_label, "Restore from SD...");
   lv_obj_center(restore_label);
 
   settings_wifi_btn_ = lv_btn_create(tab);
-  lv_obj_set_size(settings_wifi_btn_, SCR_WIDTH - 16, 38);
-  lv_obj_align(settings_wifi_btn_, LV_ALIGN_TOP_LEFT, 0, 134);
+  lv_obj_set_size(settings_wifi_btn_, SCR_WIDTH - 16, btn_h);
+  lv_obj_align(settings_wifi_btn_, LV_ALIGN_TOP_LEFT, 0, 126);
+  lv_obj_add_flag(settings_wifi_btn_, LV_OBJ_FLAG_SCROLL_CHAIN_VER);
   lv_obj_add_event_cb(settings_wifi_btn_, on_settings_wifi_clicked, LV_EVENT_CLICKED, this);
   lv_obj_t* wifi_label = lv_label_create(settings_wifi_btn_);
   lv_label_set_text(wifi_label, "WiFi Settings");
   lv_obj_center(wifi_label);
 
+  settings_ble_btn_ = lv_btn_create(tab);
+  lv_obj_set_size(settings_ble_btn_, SCR_WIDTH - 16, btn_h);
+  lv_obj_align(settings_ble_btn_, LV_ALIGN_TOP_LEFT, 0, 166);
+  lv_obj_add_flag(settings_ble_btn_, LV_OBJ_FLAG_SCROLL_CHAIN_VER);
+  lv_obj_add_event_cb(settings_ble_btn_, on_settings_ble_clicked, LV_EVENT_CLICKED, this);
+  lv_obj_t* ble_label = lv_label_create(settings_ble_btn_);
+  lv_label_set_text(ble_label, "BLE Settings");
+  lv_obj_center(ble_label);
+
+  settings_mqtt_btn_ = lv_btn_create(tab);
+  lv_obj_set_size(settings_mqtt_btn_, SCR_WIDTH - 16, btn_h);
+  lv_obj_align(settings_mqtt_btn_, LV_ALIGN_TOP_LEFT, 0, 206);
+  lv_obj_add_flag(settings_mqtt_btn_, LV_OBJ_FLAG_SCROLL_CHAIN_VER);
+  lv_obj_add_event_cb(settings_mqtt_btn_, on_settings_mqtt_clicked, LV_EVENT_CLICKED, this);
+  lv_obj_t* mqtt_label = lv_label_create(settings_mqtt_btn_);
+  lv_label_set_text(mqtt_label, "MQTT Settings");
+  lv_obj_center(mqtt_label);
+
   settings_set_time_btn_ = lv_btn_create(tab);
-  lv_obj_set_size(settings_set_time_btn_, SCR_WIDTH - 16, 38);
-  lv_obj_align(settings_set_time_btn_, LV_ALIGN_TOP_LEFT, 0, 178);
+  lv_obj_set_size(settings_set_time_btn_, SCR_WIDTH - 16, btn_h);
+  lv_obj_align(settings_set_time_btn_, LV_ALIGN_TOP_LEFT, 0, 246);
+  lv_obj_add_flag(settings_set_time_btn_, LV_OBJ_FLAG_SCROLL_CHAIN_VER);
   lv_obj_add_event_cb(settings_set_time_btn_, on_settings_set_time_clicked, LV_EVENT_CLICKED, this);
   lv_obj_t* set_time_label = lv_label_create(settings_set_time_btn_);
   lv_label_set_text(set_time_label, "Set Time");
   lv_obj_center(set_time_label);
 
+  settings_power_btn_ = lv_btn_create(tab);
+  lv_obj_set_size(settings_power_btn_, SCR_WIDTH - 16, btn_h);
+  lv_obj_align(settings_power_btn_, LV_ALIGN_TOP_LEFT, 0, 286);
+  lv_obj_add_flag(settings_power_btn_, LV_OBJ_FLAG_SCROLL_CHAIN_VER);
+  lv_obj_add_event_cb(settings_power_btn_, on_settings_power_clicked, LV_EVENT_CLICKED, this);
+  lv_obj_t* power_label = lv_label_create(settings_power_btn_);
+  lv_label_set_text(power_label, "Power Settings");
+  lv_obj_center(power_label);
+
   settings_status_ = lv_label_create(tab);
   lv_label_set_text(settings_status_, "Status: idle");
   lv_obj_set_width(settings_status_, SCR_WIDTH - 16);
   lv_label_set_long_mode(settings_status_, LV_LABEL_LONG_WRAP);
-  lv_obj_align(settings_status_, LV_ALIGN_TOP_LEFT, 0, 224);
+  lv_obj_align(settings_status_, LV_ALIGN_TOP_LEFT, 0, 326);
 }
 
 void SetupUi::rebuild_device_list() {
@@ -651,12 +1103,7 @@ void SetupUi::rebuild_activity_list() {
   const std::vector<ActivityRecord>& activities = activity_registry_.all();
   for (size_t i = 0; i < activities.size(); ++i) {
     const ActivityRecord& a = activities[i];
-    char row[120];
-    snprintf(row, sizeof(row), "%s (%u dev / %u keys / %u start)", a.name.c_str(),
-             static_cast<unsigned>(a.device_ids.size()),
-             static_cast<unsigned>(a.key_bindings.size()),
-             static_cast<unsigned>(a.startup_actions.size()));
-    lv_obj_t* btn = lv_list_add_btn(activity_list_, nullptr, row);
+    lv_obj_t* btn = lv_list_add_btn(activity_list_, nullptr, a.name.c_str());
     activity_row_buttons_.push_back(btn);
     lv_obj_add_event_cb(btn, on_activity_clicked, LV_EVENT_CLICKED, this);
   }
@@ -670,25 +1117,149 @@ void SetupUi::rebuild_activity_list() {
 }
 
 void SetupUi::rebuild_remote_activity_dropdown() {
+  if (remote_activity_dd_ == nullptr) return;
   std::string options;
-  const std::vector<ActivityRecord>& activities = activity_registry_.all();
-  for (size_t i = 0; i < activities.size(); ++i) {
+  const std::vector<DeviceRecord>& devices = device_registry_.all();
+  remote_device_ids_.clear();
+  for (size_t i = 0; i < devices.size(); ++i) {
     if (i > 0) options.append("\n");
-    options.append(activities[i].name);
+    options.append(devices[i].name);
+    remote_device_ids_.push_back(devices[i].id);
   }
 
   if (options.empty()) {
-    options = "No activity";
+    options = "No device";
   }
   lv_dropdown_set_options(remote_activity_dd_, options.c_str());
 
-  int selected = selected_activity_index_;
-  if (selected < 0 || selected >= static_cast<int>(activities.size())) {
-    selected = activities.empty() ? -1 : 0;
+  int selected = selected_device_index_;
+  if (selected < 0 || selected >= static_cast<int>(devices.size())) {
+    selected = devices.empty() ? -1 : 0;
   }
-  selected_activity_index_ = selected;
+  selected_device_index_ = selected;
   if (selected >= 0) {
     lv_dropdown_set_selected(remote_activity_dd_, static_cast<uint16_t>(selected));
+  }
+  remote_command_page_index_ = 0;
+  rebuild_remote_command_buttons();
+}
+
+void SetupUi::rebuild_remote_command_buttons() {
+  if (remote_page_ == nullptr) return;
+  for (lv_obj_t* button : remote_command_buttons_) {
+    if (button != nullptr) lv_obj_del(button);
+  }
+  remote_command_buttons_.clear();
+  remote_command_names_.clear();
+
+  if (remote_activity_dd_ == nullptr || remote_status_ == nullptr) return;
+  if (remote_device_ids_.empty()) {
+    lv_label_set_text(remote_status_, "No devices available");
+    if (remote_page_label_ != nullptr) lv_label_set_text(remote_page_label_, "Page 0/0");
+    if (remote_page_prev_btn_ != nullptr) lv_obj_add_flag(remote_page_prev_btn_, LV_OBJ_FLAG_HIDDEN);
+    if (remote_page_next_btn_ != nullptr) lv_obj_add_flag(remote_page_next_btn_, LV_OBJ_FLAG_HIDDEN);
+    return;
+  }
+
+  const uint16_t selected = lv_dropdown_get_selected(remote_activity_dd_);
+  if (selected >= remote_device_ids_.size()) {
+    lv_label_set_text(remote_status_, "Select a device");
+    if (remote_page_label_ != nullptr) lv_label_set_text(remote_page_label_, "Page 0/0");
+    if (remote_page_prev_btn_ != nullptr) lv_obj_add_flag(remote_page_prev_btn_, LV_OBJ_FLAG_HIDDEN);
+    if (remote_page_next_btn_ != nullptr) lv_obj_add_flag(remote_page_next_btn_, LV_OBJ_FLAG_HIDDEN);
+    return;
+  }
+  const DeviceRecord* device = device_registry_.get_by_id(remote_device_ids_[selected]);
+  if (device == nullptr) {
+    lv_label_set_text(remote_status_, "Selected device unavailable");
+    if (remote_page_label_ != nullptr) lv_label_set_text(remote_page_label_, "Page 0/0");
+    if (remote_page_prev_btn_ != nullptr) lv_obj_add_flag(remote_page_prev_btn_, LV_OBJ_FLAG_HIDDEN);
+    if (remote_page_next_btn_ != nullptr) lv_obj_add_flag(remote_page_next_btn_, LV_OBJ_FLAG_HIDDEN);
+    return;
+  }
+
+  std::vector<std::string> command_names;
+  command_names.reserve(device->commands.size());
+  for (const DeviceCommand& command : device->commands) {
+    if (trim_copy(command.name).empty() || trim_copy(command.payload).empty()) continue;
+    command_names.push_back(command.name);
+  }
+
+  std::unordered_map<std::string, int> command_rank;
+  const std::vector<std::string>& common = common_command_names();
+  for (size_t i = 0; i < common.size(); ++i) {
+    command_rank[lower_copy(common[i])] = static_cast<int>(i);
+  }
+  std::sort(command_names.begin(), command_names.end(),
+            [&](const std::string& a, const std::string& b) {
+              const std::string la = lower_copy(a);
+              const std::string lb = lower_copy(b);
+              const auto ra_it = command_rank.find(la);
+              const auto rb_it = command_rank.find(lb);
+              const bool a_ranked = (ra_it != command_rank.end());
+              const bool b_ranked = (rb_it != command_rank.end());
+              if (a_ranked && b_ranked && ra_it->second != rb_it->second) return ra_it->second < rb_it->second;
+              if (a_ranked != b_ranked) return a_ranked;
+              return la < lb;
+            });
+
+  constexpr int kPageSize = 12;
+  const int command_total = static_cast<int>(command_names.size());
+  const int page_count = std::max(1, (command_total + kPageSize - 1) / kPageSize);
+  if (remote_command_page_index_ < 0) remote_command_page_index_ = 0;
+  if (remote_command_page_index_ >= page_count) remote_command_page_index_ = page_count - 1;
+
+  if (remote_page_label_ != nullptr) {
+    lv_label_set_text_fmt(remote_page_label_, "Page %d/%d", remote_command_page_index_ + 1, page_count);
+  }
+  if (remote_page_prev_btn_ != nullptr) {
+    if (page_count > 1) {
+      lv_obj_clear_flag(remote_page_prev_btn_, LV_OBJ_FLAG_HIDDEN);
+    } else {
+      lv_obj_add_flag(remote_page_prev_btn_, LV_OBJ_FLAG_HIDDEN);
+    }
+  }
+  if (remote_page_next_btn_ != nullptr) {
+    if (page_count > 1) {
+      lv_obj_clear_flag(remote_page_next_btn_, LV_OBJ_FLAG_HIDDEN);
+    } else {
+      lv_obj_add_flag(remote_page_next_btn_, LV_OBJ_FLAG_HIDDEN);
+    }
+  }
+
+  const int pad = 4;
+  const int btn_w = (SCR_WIDTH - 12 - (2 * pad)) / 3;
+  const int btn_h = 30;
+  const int y_start = 108;
+  int button_count = 0;
+  const int start_index = remote_command_page_index_ * kPageSize;
+  const int end_index = std::min(command_total, start_index + kPageSize);
+  for (int i = start_index; i < end_index; ++i) {
+    const std::string& command_name = command_names[static_cast<size_t>(i)];
+    const int col = button_count % 3;
+    const int row = button_count / 3;
+    const int x = col * (btn_w + pad);
+    const int y = y_start + row * (btn_h + pad);
+
+    lv_obj_t* btn = lv_btn_create(remote_page_);
+    lv_obj_set_size(btn, btn_w, btn_h);
+    lv_obj_align(btn, LV_ALIGN_TOP_LEFT, x, y);
+    lv_obj_t* label = lv_label_create(btn);
+    lv_label_set_text(label, command_name.c_str());
+    lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(label, btn_w - 6);
+    lv_obj_center(label);
+    lv_obj_add_event_cb(btn, on_remote_command_clicked, LV_EVENT_CLICKED, this);
+
+    remote_command_buttons_.push_back(btn);
+    remote_command_names_.push_back(command_name);
+    ++button_count;
+  }
+
+  if (button_count == 0) {
+    lv_label_set_text_fmt(remote_status_, "No mapped commands for %s", device->name.c_str());
+  } else {
+    lv_label_set_text_fmt(remote_status_, "Device: %s (%d commands)", device->name.c_str(), command_total);
   }
 }
 
@@ -804,31 +1375,102 @@ void SetupUi::open_command_modal() {
   lv_obj_set_style_bg_color(command_modal_, lv_color_hex(0x202020), LV_PART_MAIN);
   lv_obj_set_style_pad_all(command_modal_, 6, LV_PART_MAIN);
   lv_obj_set_scroll_dir(command_modal_, LV_DIR_VER);
-  lv_obj_set_style_pad_bottom(command_modal_, 148, LV_PART_MAIN);
+  lv_obj_set_style_pad_bottom(command_modal_, 196, LV_PART_MAIN);
 
   lv_obj_t* title = lv_label_create(command_modal_);
   lv_label_set_text_fmt(title, "Edit: %s", device->name.c_str());
   lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 6);
 
+  dd_command_device_type_ = lv_dropdown_create(command_modal_);
+  lv_dropdown_set_options(dd_command_device_type_, kDeviceTypeOptions);
+  lv_obj_set_width(dd_command_device_type_, SCR_WIDTH - 12);
+  lv_obj_align(dd_command_device_type_, LV_ALIGN_TOP_LEFT, 0, 30);
+  switch (device->type) {
+    case DeviceType::TV:
+      lv_dropdown_set_selected(dd_command_device_type_, 0);
+      break;
+    case DeviceType::AVR:
+      lv_dropdown_set_selected(dd_command_device_type_, 1);
+      break;
+    case DeviceType::MediaPlayer:
+      lv_dropdown_set_selected(dd_command_device_type_, 2);
+      break;
+    case DeviceType::SmartHome:
+      lv_dropdown_set_selected(dd_command_device_type_, 3);
+      break;
+    case DeviceType::Lighting:
+      lv_dropdown_set_selected(dd_command_device_type_, 4);
+      break;
+    case DeviceType::Custom:
+    default:
+      lv_dropdown_set_selected(dd_command_device_type_, 5);
+      break;
+  }
+
+  dd_command_transport_ = lv_dropdown_create(command_modal_);
+  lv_dropdown_set_options(dd_command_transport_, kTransportOptions);
+  lv_obj_set_width(dd_command_transport_, SCR_WIDTH - 12);
+  lv_obj_align(dd_command_transport_, LV_ALIGN_TOP_LEFT, 0, 62);
+  lv_obj_add_event_cb(dd_command_transport_, on_command_transport_changed, LV_EVENT_VALUE_CHANGED, this);
+  switch (device->transport) {
+    case TransportType::IR:
+      lv_dropdown_set_selected(dd_command_transport_, 0);
+      break;
+    case TransportType::BLE:
+      lv_dropdown_set_selected(dd_command_transport_, 1);
+      break;
+    case TransportType::MQTT:
+      lv_dropdown_set_selected(dd_command_transport_, 2);
+      break;
+    case TransportType::HTTP:
+    default:
+      lv_dropdown_set_selected(dd_command_transport_, 3);
+      break;
+  }
+
   dd_command_name_ = lv_dropdown_create(command_modal_);
   lv_obj_set_width(dd_command_name_, SCR_WIDTH - 12);
-  lv_obj_align(dd_command_name_, LV_ALIGN_TOP_LEFT, 0, 28);
+  lv_obj_align(dd_command_name_, LV_ALIGN_TOP_LEFT, 0, 94);
   lv_obj_add_event_cb(dd_command_name_, on_command_name_changed, LV_EVENT_VALUE_CHANGED, this);
 
   ta_command_payload_ = lv_textarea_create(command_modal_);
   lv_obj_set_width(ta_command_payload_, SCR_WIDTH - 12);
   lv_obj_set_height(ta_command_payload_, 64);
-  lv_textarea_set_placeholder_text(ta_command_payload_, "IR payload: data:bits:repeat (e.g. 0x20DF10EF:32:0)");
-  lv_obj_align(ta_command_payload_, LV_ALIGN_TOP_LEFT, 0, 62);
+  lv_obj_align(ta_command_payload_, LV_ALIGN_TOP_LEFT, 0, 128);
   lv_obj_add_event_cb(ta_command_payload_, on_textarea_focus, LV_EVENT_FOCUSED, this);
 
-  lv_obj_t* hint = lv_label_create(command_modal_);
-  lv_label_set_text(hint, "Select 'Add New' in the list to create a command name.");
-  lv_obj_align(hint, LV_ALIGN_TOP_LEFT, 0, 130);
+  command_hint_label_ = lv_label_create(command_modal_);
+  lv_obj_set_width(command_hint_label_, SCR_WIDTH - 12);
+  lv_label_set_long_mode(command_hint_label_, LV_LABEL_LONG_WRAP);
+  lv_obj_align(command_hint_label_, LV_ALIGN_TOP_LEFT, 0, 196);
+
+  command_template_label_ = lv_label_create(command_modal_);
+  lv_label_set_text(command_template_label_, "MQTT template");
+  lv_obj_align(command_template_label_, LV_ALIGN_TOP_LEFT, 0, 228);
+
+  dd_command_template_ = lv_dropdown_create(command_modal_);
+  lv_obj_set_width(dd_command_template_, SCR_WIDTH - 12);
+  lv_obj_align(dd_command_template_, LV_ALIGN_TOP_LEFT, 0, 246);
+  lv_dropdown_set_options(dd_command_template_, mqtt_template_dropdown_options().c_str());
+  lv_dropdown_set_selected(dd_command_template_, 0);
+
+  dd_command_import_mode_ = lv_dropdown_create(command_modal_);
+  lv_obj_set_width(dd_command_import_mode_, (SCR_WIDTH - 18) / 2);
+  lv_obj_align(dd_command_import_mode_, LV_ALIGN_TOP_LEFT, 0, 280);
+  lv_dropdown_set_options(dd_command_import_mode_, "Merge\nReplace");
+  lv_dropdown_set_selected(dd_command_import_mode_, 0);
+
+  command_template_apply_btn_ = lv_btn_create(command_modal_);
+  lv_obj_set_size(command_template_apply_btn_, (SCR_WIDTH - 18) / 2, 30);
+  lv_obj_align(command_template_apply_btn_, LV_ALIGN_TOP_RIGHT, 0, 280);
+  lv_obj_add_event_cb(command_template_apply_btn_, on_command_template_apply, LV_EVENT_CLICKED, this);
+  lv_obj_t* template_apply_text = lv_label_create(command_template_apply_btn_);
+  lv_label_set_text(template_apply_text, "Apply Template");
+  lv_obj_center(template_apply_text);
 
   lv_obj_t* cancel_btn = lv_btn_create(command_modal_);
   lv_obj_set_size(cancel_btn, (SCR_WIDTH - 24) / 3, 32);
-  lv_obj_align(cancel_btn, LV_ALIGN_TOP_LEFT, 0, 154);
+  lv_obj_align(cancel_btn, LV_ALIGN_TOP_LEFT, 0, 318);
   lv_obj_add_event_cb(cancel_btn, on_command_modal_close, LV_EVENT_CLICKED, this);
   lv_obj_t* cancel_text = lv_label_create(cancel_btn);
   lv_label_set_text(cancel_text, "Close");
@@ -836,7 +1478,7 @@ void SetupUi::open_command_modal() {
 
   lv_obj_t* save_btn = lv_btn_create(command_modal_);
   lv_obj_set_size(save_btn, (SCR_WIDTH - 24) / 3, 32);
-  lv_obj_align(save_btn, LV_ALIGN_TOP_MID, 0, 154);
+  lv_obj_align(save_btn, LV_ALIGN_TOP_MID, 0, 318);
   lv_obj_add_event_cb(save_btn, on_command_modal_save, LV_EVENT_CLICKED, this);
   lv_obj_t* save_text = lv_label_create(save_btn);
   lv_label_set_text(save_text, "Save");
@@ -844,7 +1486,7 @@ void SetupUi::open_command_modal() {
 
   lv_obj_t* remove_btn = lv_btn_create(command_modal_);
   lv_obj_set_size(remove_btn, (SCR_WIDTH - 24) / 3, 32);
-  lv_obj_align(remove_btn, LV_ALIGN_TOP_RIGHT, 0, 154);
+  lv_obj_align(remove_btn, LV_ALIGN_TOP_RIGHT, 0, 318);
   lv_obj_add_event_cb(remove_btn, on_command_modal_remove, LV_EVENT_CLICKED, this);
   lv_obj_t* remove_text = lv_label_create(remove_btn);
   lv_label_set_text(remove_text, "Remove");
@@ -852,23 +1494,23 @@ void SetupUi::open_command_modal() {
 
   lv_obj_t* test_btn = lv_btn_create(command_modal_);
   lv_obj_set_size(test_btn, (SCR_WIDTH - 18) / 2, 28);
-  lv_obj_align(test_btn, LV_ALIGN_TOP_LEFT, 0, 192);
+  lv_obj_align(test_btn, LV_ALIGN_TOP_LEFT, 0, 356);
   lv_obj_add_event_cb(test_btn, on_command_modal_test, LV_EVENT_CLICKED, this);
   lv_obj_t* test_text = lv_label_create(test_btn);
   lv_label_set_text(test_text, "Test Command");
   lv_obj_center(test_text);
 
-  lv_obj_t* learn_btn = lv_btn_create(command_modal_);
-  lv_obj_set_size(learn_btn, (SCR_WIDTH - 18) / 2, 28);
-  lv_obj_align(learn_btn, LV_ALIGN_TOP_RIGHT, 0, 192);
-  lv_obj_add_event_cb(learn_btn, on_command_modal_learn, LV_EVENT_CLICKED, this);
-  lv_obj_t* learn_text = lv_label_create(learn_btn);
+  command_learn_btn_ = lv_btn_create(command_modal_);
+  lv_obj_set_size(command_learn_btn_, (SCR_WIDTH - 18) / 2, 28);
+  lv_obj_align(command_learn_btn_, LV_ALIGN_TOP_RIGHT, 0, 356);
+  lv_obj_add_event_cb(command_learn_btn_, on_command_modal_learn, LV_EVENT_CLICKED, this);
+  lv_obj_t* learn_text = lv_label_create(command_learn_btn_);
   lv_label_set_text(learn_text, "Learn IR");
   lv_obj_center(learn_text);
 
   command_learn_status_ = lv_label_create(command_modal_);
-  lv_label_set_text(command_learn_status_, "Learn: idle");
-  lv_obj_align(command_learn_status_, LV_ALIGN_TOP_LEFT, 0, 226);
+  lv_label_set_text(command_learn_status_, "Ready");
+  lv_obj_align(command_learn_status_, LV_ALIGN_TOP_LEFT, 0, 390);
 
   keyboard_ = lv_keyboard_create(root_);
   lv_obj_set_size(keyboard_, SCR_WIDTH, 136);
@@ -878,6 +1520,7 @@ void SetupUi::open_command_modal() {
 
   refresh_command_name_dropdown();
   update_command_payload_for_selected_name();
+  refresh_command_modal_transport_ui();
 }
 
 void SetupUi::close_command_modal() {
@@ -886,8 +1529,16 @@ void SetupUi::close_command_modal() {
   if (command_modal_ == nullptr) return;
   lv_obj_del(command_modal_);
   command_modal_ = nullptr;
+  dd_command_device_type_ = nullptr;
+  dd_command_transport_ = nullptr;
   dd_command_name_ = nullptr;
   ta_command_payload_ = nullptr;
+  command_hint_label_ = nullptr;
+  command_template_label_ = nullptr;
+  dd_command_template_ = nullptr;
+  dd_command_import_mode_ = nullptr;
+  command_template_apply_btn_ = nullptr;
+  command_learn_btn_ = nullptr;
   command_learn_status_ = nullptr;
   if (keyboard_ != nullptr) {
     lv_obj_del(keyboard_);
@@ -895,24 +1546,251 @@ void SetupUi::close_command_modal() {
   }
 }
 
-bool SetupUi::save_command_modal() {
-  if (dd_command_name_ == nullptr || ta_command_payload_ == nullptr || command_editor_device_id_ == 0) return false;
+void SetupUi::refresh_command_modal_transport_ui() {
+  if (dd_command_transport_ == nullptr) return;
+
+  char transport_buf[16];
+  lv_dropdown_get_selected_str(dd_command_transport_, transport_buf, sizeof(transport_buf));
+  const TransportType selected_transport = transport_type_from_string(transport_buf);
+
+  if (ta_command_payload_ != nullptr) {
+    if (selected_transport == TransportType::MQTT) {
+      lv_textarea_set_placeholder_text(ta_command_payload_, "MQTT: topic|payload");
+    } else if (selected_transport == TransportType::BLE) {
+      lv_textarea_set_placeholder_text(ta_command_payload_, "BLE: key:up / media:playpause / text:hello");
+    } else if (selected_transport == TransportType::HTTP) {
+      lv_textarea_set_placeholder_text(ta_command_payload_, "HTTP command payload (future support)");
+    } else {
+      lv_textarea_set_placeholder_text(ta_command_payload_, "IR payload: data:bits:repeat (e.g. 0x20DF10EF:32:0)");
+    }
+  }
+
+  if (command_hint_label_ != nullptr) {
+    if (selected_transport == TransportType::MQTT) {
+      lv_label_set_text(command_hint_label_, "Use template import or enter topic|payload manually.");
+    } else if (selected_transport == TransportType::BLE) {
+      lv_label_set_text(command_hint_label_, "Use key:<name>, media:<name>, or text:<value>. Optional target: AA:BB:..@key:up");
+    } else if (selected_transport == TransportType::HTTP) {
+      lv_label_set_text(command_hint_label_, "HTTP command dispatch is not enabled yet in this target.");
+    } else {
+      lv_label_set_text(command_hint_label_, "Select 'Add New' in the list to create a command name.");
+    }
+  }
+
+  const bool mqtt_mode = selected_transport == TransportType::MQTT;
+  const bool ir_mode = selected_transport == TransportType::IR;
+
+  if (command_template_label_ != nullptr) {
+    if (mqtt_mode) {
+      lv_obj_clear_flag(command_template_label_, LV_OBJ_FLAG_HIDDEN);
+    } else {
+      lv_obj_add_flag(command_template_label_, LV_OBJ_FLAG_HIDDEN);
+    }
+  }
+  if (dd_command_template_ != nullptr) {
+    if (mqtt_mode) {
+      lv_obj_clear_flag(dd_command_template_, LV_OBJ_FLAG_HIDDEN);
+    } else {
+      lv_obj_add_flag(dd_command_template_, LV_OBJ_FLAG_HIDDEN);
+      lv_dropdown_set_selected(dd_command_template_, 0);
+    }
+  }
+  if (dd_command_import_mode_ != nullptr) {
+    if (mqtt_mode) {
+      lv_obj_clear_flag(dd_command_import_mode_, LV_OBJ_FLAG_HIDDEN);
+    } else {
+      lv_obj_add_flag(dd_command_import_mode_, LV_OBJ_FLAG_HIDDEN);
+      lv_dropdown_set_selected(dd_command_import_mode_, 0);
+    }
+  }
+  if (command_template_apply_btn_ != nullptr) {
+    if (mqtt_mode) {
+      lv_obj_clear_flag(command_template_apply_btn_, LV_OBJ_FLAG_HIDDEN);
+    } else {
+      lv_obj_add_flag(command_template_apply_btn_, LV_OBJ_FLAG_HIDDEN);
+    }
+  }
+  if (command_learn_btn_ != nullptr) {
+    if (ir_mode) {
+      lv_obj_clear_flag(command_learn_btn_, LV_OBJ_FLAG_HIDDEN);
+    } else {
+      lv_obj_add_flag(command_learn_btn_, LV_OBJ_FLAG_HIDDEN);
+      stop_ir_learning();
+    }
+  }
+  if (command_learn_status_ != nullptr) {
+    if (selected_transport == TransportType::MQTT) {
+      lv_label_set_text(command_learn_status_, "MQTT format: topic|payload");
+    } else if (selected_transport == TransportType::BLE) {
+      lv_label_set_text(command_learn_status_, "BLE format: key/media/text");
+    } else if (selected_transport == TransportType::HTTP) {
+      lv_label_set_text(command_learn_status_, "HTTP format: pending runtime support");
+    } else {
+      lv_label_set_text(command_learn_status_, "Learn: idle");
+    }
+  }
+}
+
+bool SetupUi::apply_command_template() {
+  if (command_editor_device_id_ == 0 || dd_command_transport_ == nullptr || dd_command_template_ == nullptr ||
+      ta_command_payload_ == nullptr || dd_command_name_ == nullptr) {
+    return false;
+  }
+
   DeviceRecord* device = device_registry_.get_by_id(command_editor_device_id_);
   if (device == nullptr) return false;
 
+  char transport_buf[16];
+  lv_dropdown_get_selected_str(dd_command_transport_, transport_buf, sizeof(transport_buf));
+  const TransportType selected_transport = transport_type_from_string(transport_buf);
+  if (selected_transport != TransportType::MQTT) {
+    if (command_learn_status_ != nullptr) {
+      lv_label_set_text(command_learn_status_, "Templates apply to MQTT commands only");
+    }
+    return false;
+  }
+
+  const uint16_t template_index = lv_dropdown_get_selected(dd_command_template_);
+  const MqttTemplateDef* tmpl = mqtt_template_for_index(template_index);
+  if (tmpl == nullptr || tmpl->command_name == nullptr || std::string(tmpl->command_name).empty()) {
+    if (command_learn_status_ != nullptr) lv_label_set_text(command_learn_status_, "Select a template first");
+    return false;
+  }
+
+  if (selected_command_name().empty()) {
+    if (find_command_by_name(*device, tmpl->command_name) == nullptr) {
+      upsert_command(device, tmpl->command_name, "");
+      device_registry_.save();
+      refresh_command_name_dropdown();
+    }
+    for (uint16_t i = 0; i < device->commands.size(); ++i) {
+      if (device->commands[i].name == tmpl->command_name) {
+        lv_dropdown_set_selected(dd_command_name_, i);
+        break;
+      }
+    }
+    update_command_payload_for_selected_name();
+  }
+
+  std::string topic_base = trim_copy(device->address);
+  if (topic_base.empty()) topic_base = "cmnd/device";
+  std::string topic = topic_base;
+  if (tmpl->topic_suffix != nullptr && tmpl->topic_suffix[0] != '\0') {
+    if (!topic.empty() && topic.back() != '/') topic.push_back('/');
+    topic += tmpl->topic_suffix;
+  }
+  std::string template_payload = topic;
+  template_payload += "|";
+  template_payload += (tmpl->payload == nullptr ? "" : tmpl->payload);
+
+  const std::string existing_payload = trim_copy(lv_textarea_get_text(ta_command_payload_));
+  const uint16_t import_mode = dd_command_import_mode_ != nullptr ? lv_dropdown_get_selected(dd_command_import_mode_) : 0;
+  const bool replace_mode = (import_mode == 1);
+  if (!replace_mode && !existing_payload.empty() && existing_payload != template_payload) {
+    if (command_learn_status_ != nullptr) {
+      lv_label_set_text(command_learn_status_, "Template skipped (merge): payload already set");
+    }
+    return false;
+  }
+
+  lv_textarea_set_text(ta_command_payload_, template_payload.c_str());
+  if (command_learn_status_ != nullptr) {
+    lv_label_set_text_fmt(command_learn_status_, "Template applied: %s", tmpl->label);
+  }
+  return true;
+}
+
+bool SetupUi::save_command_modal() {
+  if (dd_command_name_ == nullptr || ta_command_payload_ == nullptr || dd_command_device_type_ == nullptr ||
+      dd_command_transport_ == nullptr || command_editor_device_id_ == 0) return false;
+  DeviceRecord* device = device_registry_.get_by_id(command_editor_device_id_);
+  if (device == nullptr) return false;
+
+  char type_buf[32];
+  lv_dropdown_get_selected_str(dd_command_device_type_, type_buf, sizeof(type_buf));
+  const DeviceType selected_type = device_type_from_string(type_buf);
+
+  char transport_buf[16];
+  lv_dropdown_get_selected_str(dd_command_transport_, transport_buf, sizeof(transport_buf));
+  const TransportType selected_transport = transport_type_from_string(transport_buf);
+
+  const bool type_changed = (device->type != selected_type);
+  const bool transport_changed = (device->transport != selected_transport);
+  if (type_changed) {
+    device->type = selected_type;
+  }
+  if (transport_changed) {
+    device->transport = selected_transport;
+  }
+
   const std::string command_name = selected_command_name();
   if (command_name.empty()) {
+    if (type_changed || transport_changed) {
+      device_registry_.save();
+      rebuild_device_list();
+      rebuild_remote_command_buttons();
+      lv_label_set_text_fmt(remote_status_, "Saved device: %s / %s", to_string(device->type), to_string(device->transport));
+      return true;
+    }
     lv_label_set_text(remote_status_, "Select or add a command name");
     return false;
   }
   std::string payload = lv_textarea_get_text(ta_command_payload_);
-  if (device->transport == TransportType::IR && !is_valid_ir_payload(payload)) {
-    lv_label_set_text(remote_status_, "Invalid IR payload format");
-    return false;
+  const DeviceCommand* existing_command = find_command_by_name(*device, command_name);
+  const bool payload_changed = (existing_command == nullptr) || (existing_command->payload != payload);
+
+  if (!payload_changed && (type_changed || transport_changed)) {
+    device_registry_.save();
+    rebuild_device_list();
+    rebuild_remote_command_buttons();
+    lv_label_set_text_fmt(remote_status_, "Saved device: %s / %s", to_string(device->type), to_string(device->transport));
+    refresh_command_name_dropdown();
+    return true;
+  }
+
+  std::string payload_error;
+  if (selected_transport == TransportType::IR) {
+    if (!validate_ir_payload(payload, &payload_error)) {
+      if (command_learn_status_ != nullptr) {
+        lv_label_set_text_fmt(command_learn_status_, "IR format error: %s", payload_error.c_str());
+      }
+      lv_label_set_text_fmt(remote_status_, "Invalid IR payload: %s", payload_error.c_str());
+      return false;
+    }
+  } else if (selected_transport == TransportType::MQTT) {
+    if (!validate_mqtt_payload(payload, device->address, &payload_error)) {
+      if (command_learn_status_ != nullptr) {
+        lv_label_set_text_fmt(command_learn_status_, "MQTT format error: %s", payload_error.c_str());
+      }
+      lv_label_set_text_fmt(remote_status_, "Invalid MQTT payload: %s", payload_error.c_str());
+      return false;
+    }
+  } else if (selected_transport == TransportType::BLE) {
+    if (!validate_ble_payload(payload, &payload_error)) {
+      if (command_learn_status_ != nullptr) {
+        lv_label_set_text_fmt(command_learn_status_, "BLE format error: %s", payload_error.c_str());
+      }
+      lv_label_set_text_fmt(remote_status_, "Invalid BLE payload: %s", payload_error.c_str());
+      return false;
+    }
   }
   upsert_command(device, command_name, payload);
   device_registry_.save();
+  if (type_changed || transport_changed) {
+    rebuild_device_list();
+  }
+  rebuild_remote_command_buttons();
+  if (command_learn_status_ != nullptr) {
+    if (selected_transport == TransportType::IR) {
+      lv_label_set_text(command_learn_status_, "IR format: valid");
+    } else if (selected_transport == TransportType::MQTT) {
+      lv_label_set_text(command_learn_status_, "MQTT format: valid");
+    } else if (selected_transport == TransportType::BLE) {
+      lv_label_set_text(command_learn_status_, "BLE format: valid");
+    }
+  }
   lv_label_set_text_fmt(remote_status_, "Saved command: %s", command_name.c_str());
+  rebuild_remote_command_buttons();
   refresh_command_name_dropdown();
   return true;
 }
@@ -943,6 +1821,7 @@ bool SetupUi::remove_command_modal() {
         refresh_activity_keymap_binding_hint();
       }
       lv_label_set_text_fmt(remote_status_, "Removed command: %s", command_name.c_str());
+      rebuild_remote_command_buttons();
       return true;
     }
   }
@@ -1194,10 +2073,16 @@ bool SetupUi::save_rename_modal() {
 
 void SetupUi::test_current_command() {
   if (command_editor_device_id_ == 0) return;
-  save_command_modal();
+  if (!save_command_modal()) return;
   const std::string command_name = selected_command_name();
   if (command_name.empty()) return;
-  dispatcher_.dispatch_device_command(command_editor_device_id_, command_name);
+  if (dispatcher_.dispatch_device_command(command_editor_device_id_, command_name)) {
+    if (remote_status_ != nullptr) {
+      lv_label_set_text_fmt(remote_status_, "Test sent: %s", command_name.c_str());
+    }
+  } else if (remote_status_ != nullptr) {
+    lv_label_set_text_fmt(remote_status_, "Test failed: %s", dispatcher_.last_status().c_str());
+  }
 }
 
 void SetupUi::start_ir_learning() {
@@ -1234,8 +2119,9 @@ void SetupUi::handle_ir_learned_message(const std::string& message) {
   }
   std::string protocol = message.substr(0, sep);
   std::string payload = trim_copy(message.substr(sep + 1));
-  if (!is_valid_ir_payload(payload)) {
-    lv_label_set_text(command_learn_status_, "Learn: bad payload");
+  std::string payload_error;
+  if (!validate_ir_payload(payload, &payload_error)) {
+    lv_label_set_text_fmt(command_learn_status_, "Learn: bad payload (%s)", payload_error.c_str());
     return;
   }
 
@@ -1273,30 +2159,13 @@ void SetupUi::open_activity_modal() {
   lv_obj_align(ta_activity_name_, LV_ALIGN_TOP_LEFT, 0, 24);
   lv_obj_add_event_cb(ta_activity_name_, on_textarea_focus, LV_EVENT_FOCUSED, this);
 
-  activity_device_list_ = lv_obj_create(activity_modal_);
-  lv_obj_set_size(activity_device_list_, SCR_WIDTH - 12, 90);
-  lv_obj_align(activity_device_list_, LV_ALIGN_TOP_LEFT, 0, 58);
-  lv_obj_set_style_pad_all(activity_device_list_, 4, LV_PART_MAIN);
-  lv_obj_set_flex_flow(activity_device_list_, LV_FLEX_FLOW_COLUMN);
-  lv_obj_set_scroll_dir(activity_device_list_, LV_DIR_VER);
-
-  activity_device_checkboxes_.clear();
-  activity_device_checkbox_ids_.clear();
-  const std::vector<DeviceRecord>& devices = device_registry_.all();
-  for (const DeviceRecord& device : devices) {
-    lv_obj_t* cb = lv_checkbox_create(activity_device_list_);
-    lv_checkbox_set_text(cb, device.name.c_str());
-    activity_device_checkboxes_.push_back(cb);
-    activity_device_checkbox_ids_.push_back(device.id);
-  }
-
   lv_obj_t* note = lv_label_create(activity_modal_);
-  lv_label_set_text(note, "Select devices for this activity.");
-  lv_obj_align(note, LV_ALIGN_TOP_LEFT, 0, 152);
+  lv_label_set_text(note, "Devices are mapped in Edit.");
+  lv_obj_align(note, LV_ALIGN_TOP_LEFT, 0, 58);
 
   lv_obj_t* cancel_btn = lv_btn_create(activity_modal_);
   lv_obj_set_size(cancel_btn, (SCR_WIDTH - 18) / 2, 32);
-  lv_obj_align(cancel_btn, LV_ALIGN_TOP_LEFT, 0, 172);
+  lv_obj_align(cancel_btn, LV_ALIGN_TOP_LEFT, 0, 84);
   lv_obj_add_event_cb(cancel_btn, on_activity_modal_close, LV_EVENT_CLICKED, this);
   lv_obj_t* cancel_text = lv_label_create(cancel_btn);
   lv_label_set_text(cancel_text, "Cancel");
@@ -1304,7 +2173,7 @@ void SetupUi::open_activity_modal() {
 
   lv_obj_t* save_btn = lv_btn_create(activity_modal_);
   lv_obj_set_size(save_btn, (SCR_WIDTH - 18) / 2, 32);
-  lv_obj_align(save_btn, LV_ALIGN_TOP_RIGHT, 0, 172);
+  lv_obj_align(save_btn, LV_ALIGN_TOP_RIGHT, 0, 84);
   lv_obj_add_event_cb(save_btn, on_activity_modal_save, LV_EVENT_CLICKED, this);
   lv_obj_t* save_text = lv_label_create(save_btn);
   lv_label_set_text(save_text, "Save");
@@ -1322,9 +2191,6 @@ void SetupUi::close_activity_modal() {
   lv_obj_del(activity_modal_);
   activity_modal_ = nullptr;
   ta_activity_name_ = nullptr;
-  activity_device_list_ = nullptr;
-  activity_device_checkboxes_.clear();
-  activity_device_checkbox_ids_.clear();
   if (keyboard_ != nullptr) {
     lv_obj_del(keyboard_);
     keyboard_ = nullptr;
@@ -1340,12 +2206,6 @@ bool SetupUi::save_activity_modal() {
   ActivityRecord activity;
   activity.name = lv_textarea_get_text(ta_activity_name_);
   if (activity.name.empty()) activity.name = "New Activity";
-
-  for (size_t i = 0; i < activity_device_checkboxes_.size() && i < activity_device_checkbox_ids_.size(); ++i) {
-    if (lv_obj_has_state(activity_device_checkboxes_[i], LV_STATE_CHECKED)) {
-      activity.device_ids.push_back(activity_device_checkbox_ids_[i]);
-    }
-  }
 
   const size_t before = activity_registry_.count();
   if (activity_registry_.add(activity)) {
@@ -1373,9 +2233,11 @@ void SetupUi::open_activity_keymap_modal() {
   lv_obj_center(activity_keymap_modal_);
   lv_obj_set_style_bg_color(activity_keymap_modal_, lv_color_hex(0x202020), LV_PART_MAIN);
   lv_obj_set_style_pad_all(activity_keymap_modal_, 6, LV_PART_MAIN);
+  lv_obj_set_scroll_dir(activity_keymap_modal_, LV_DIR_VER);
+  lv_obj_set_style_pad_bottom(activity_keymap_modal_, 148, LV_PART_MAIN);
 
   lv_obj_t* title = lv_label_create(activity_keymap_modal_);
-  lv_label_set_text_fmt(title, "Keymap: %s", activities[selected_activity_index_].name.c_str());
+  lv_label_set_text_fmt(title, "Edit: %s", activities[selected_activity_index_].name.c_str());
   lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 6);
 
   dd_keymap_key_ = lv_dropdown_create(activity_keymap_modal_);
@@ -1383,28 +2245,44 @@ void SetupUi::open_activity_keymap_modal() {
   lv_obj_align(dd_keymap_key_, LV_ALIGN_TOP_LEFT, 0, 30);
   lv_obj_add_event_cb(dd_keymap_key_, on_activity_keymap_command_changed, LV_EVENT_VALUE_CHANGED, this);
 
+  ta_keymap_device_filter_ = lv_textarea_create(activity_keymap_modal_);
+  lv_textarea_set_one_line(ta_keymap_device_filter_, true);
+  lv_textarea_set_placeholder_text(ta_keymap_device_filter_, "Filter devices");
+  lv_obj_set_width(ta_keymap_device_filter_, SCR_WIDTH - 12);
+  lv_obj_align(ta_keymap_device_filter_, LV_ALIGN_TOP_LEFT, 0, 62);
+  lv_obj_add_event_cb(ta_keymap_device_filter_, on_textarea_focus, LV_EVENT_FOCUSED, this);
+  lv_obj_add_event_cb(ta_keymap_device_filter_, on_activity_keymap_device_filter_changed, LV_EVENT_VALUE_CHANGED, this);
+
   dd_keymap_device_ = lv_dropdown_create(activity_keymap_modal_);
   lv_obj_set_width(dd_keymap_device_, SCR_WIDTH - 12);
-  lv_obj_align(dd_keymap_device_, LV_ALIGN_TOP_LEFT, 0, 68);
+  lv_obj_align(dd_keymap_device_, LV_ALIGN_TOP_LEFT, 0, 92);
   lv_obj_add_event_cb(dd_keymap_device_, on_activity_keymap_device_changed, LV_EVENT_VALUE_CHANGED, this);
+
+  ta_keymap_command_filter_ = lv_textarea_create(activity_keymap_modal_);
+  lv_textarea_set_one_line(ta_keymap_command_filter_, true);
+  lv_textarea_set_placeholder_text(ta_keymap_command_filter_, "Filter commands");
+  lv_obj_set_width(ta_keymap_command_filter_, SCR_WIDTH - 12);
+  lv_obj_align(ta_keymap_command_filter_, LV_ALIGN_TOP_LEFT, 0, 124);
+  lv_obj_add_event_cb(ta_keymap_command_filter_, on_textarea_focus, LV_EVENT_FOCUSED, this);
+  lv_obj_add_event_cb(ta_keymap_command_filter_, on_activity_keymap_command_filter_changed, LV_EVENT_VALUE_CHANGED, this);
 
   dd_keymap_command_ = lv_dropdown_create(activity_keymap_modal_);
   lv_obj_set_width(dd_keymap_command_, SCR_WIDTH - 12);
-  lv_obj_align(dd_keymap_command_, LV_ALIGN_TOP_LEFT, 0, 100);
+  lv_obj_align(dd_keymap_command_, LV_ALIGN_TOP_LEFT, 0, 154);
   lv_obj_add_event_cb(dd_keymap_command_, on_activity_keymap_command_changed, LV_EVENT_VALUE_CHANGED, this);
 
   keymap_status_label_ = lv_label_create(activity_keymap_modal_);
   lv_label_set_text(keymap_status_label_, "Pick key + device + command, then Save");
-  lv_obj_align(keymap_status_label_, LV_ALIGN_TOP_LEFT, 0, 132);
+  lv_obj_align(keymap_status_label_, LV_ALIGN_TOP_LEFT, 0, 186);
 
   keymap_slot_hint_label_ = lv_label_create(activity_keymap_modal_);
   lv_obj_set_width(keymap_slot_hint_label_, SCR_WIDTH - 12);
   lv_label_set_long_mode(keymap_slot_hint_label_, LV_LABEL_LONG_WRAP);
-  lv_obj_align(keymap_slot_hint_label_, LV_ALIGN_TOP_LEFT, 0, 148);
+  lv_obj_align(keymap_slot_hint_label_, LV_ALIGN_TOP_LEFT, 0, 202);
 
   lv_obj_t* close_btn = lv_btn_create(activity_keymap_modal_);
   lv_obj_set_size(close_btn, (SCR_WIDTH - 18) / 2, 32);
-  lv_obj_align(close_btn, LV_ALIGN_TOP_LEFT, 0, 216);
+  lv_obj_align(close_btn, LV_ALIGN_TOP_LEFT, 0, 250);
   lv_obj_add_event_cb(close_btn, on_activity_keymap_close, LV_EVENT_CLICKED, this);
   lv_obj_t* close_text = lv_label_create(close_btn);
   lv_label_set_text(close_text, "Close");
@@ -1412,11 +2290,17 @@ void SetupUi::open_activity_keymap_modal() {
 
   lv_obj_t* save_btn = lv_btn_create(activity_keymap_modal_);
   lv_obj_set_size(save_btn, (SCR_WIDTH - 18) / 2, 32);
-  lv_obj_align(save_btn, LV_ALIGN_TOP_RIGHT, 0, 216);
+  lv_obj_align(save_btn, LV_ALIGN_TOP_RIGHT, 0, 250);
   lv_obj_add_event_cb(save_btn, on_activity_keymap_save, LV_EVENT_CLICKED, this);
   lv_obj_t* save_text = lv_label_create(save_btn);
   lv_label_set_text(save_text, "Save Mapping");
   lv_obj_center(save_text);
+
+  keyboard_ = lv_keyboard_create(root_);
+  lv_obj_set_size(keyboard_, SCR_WIDTH, 128);
+  lv_obj_align(keyboard_, LV_ALIGN_BOTTOM_MID, 0, 0);
+  lv_obj_add_flag(keyboard_, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_event_cb(keyboard_, on_keyboard_apply, LV_EVENT_READY, this);
 
   refresh_activity_key_options();
   refresh_activity_keymap_device_dropdown();
@@ -1425,15 +2309,25 @@ void SetupUi::open_activity_keymap_modal() {
 }
 
 void SetupUi::close_activity_keymap_modal() {
+  close_activity_keymap_overwrite_modal();
   if (activity_keymap_modal_ == nullptr) return;
   lv_obj_del(activity_keymap_modal_);
   activity_keymap_modal_ = nullptr;
   dd_keymap_key_ = nullptr;
+  ta_keymap_device_filter_ = nullptr;
   dd_keymap_device_ = nullptr;
+  ta_keymap_command_filter_ = nullptr;
   dd_keymap_command_ = nullptr;
   keymap_status_label_ = nullptr;
   keymap_slot_hint_label_ = nullptr;
   keymap_device_ids_.clear();
+  pending_keymap_key_char_ = '\0';
+  pending_keymap_device_id_ = 0;
+  pending_keymap_command_name_.clear();
+  if (keyboard_ != nullptr) {
+    lv_obj_del(keyboard_);
+    keyboard_ = nullptr;
+  }
 }
 
 void SetupUi::save_activity_keymap_modal() {
@@ -1459,28 +2353,24 @@ void SetupUi::save_activity_keymap_modal() {
     return;
   }
 
-  ActivityRecord updated = activities[selected_activity_index_];
-  bool replaced = false;
-  for (ActivityKeyBinding& binding : updated.key_bindings) {
-    if (binding.key_char == key_char) {
-      binding.device_id = device_id;
-      binding.command_name = command_name;
-      replaced = true;
-      break;
+  const ActivityRecord& activity = activities[selected_activity_index_];
+  for (const ActivityKeyBinding& binding : activity.key_bindings) {
+    if (binding.key_char != key_char) continue;
+    if (binding.device_id == device_id && binding.command_name == command_name) {
+      lv_label_set_text_fmt(keymap_status_label_, "No change: %c already mapped", key_char);
+      return;
     }
+    open_activity_keymap_overwrite_modal(binding, device_id, command_name);
+    return;
   }
-  if (!replaced) {
-    ActivityKeyBinding binding;
-    binding.key_char = key_char;
-    binding.device_id = device_id;
-    binding.command_name = command_name;
-    updated.key_bindings.push_back(binding);
+
+  pending_keymap_key_char_ = key_char;
+  pending_keymap_device_id_ = device_id;
+  pending_keymap_command_name_ = command_name;
+  apply_activity_keymap_pending_overwrite();
+  if (selected_device != nullptr) {
+    lv_label_set_text_fmt(keymap_status_label_, "Saved: %c -> %s (%s)", key_char, command_name.c_str(), selected_device->name.c_str());
   }
-  activity_registry_.upsert(updated);
-  lv_label_set_text_fmt(keymap_status_label_, "Saved: %c -> %s (%s)", key_char, command_name.c_str(), selected_device != nullptr ? selected_device->name.c_str() : "Unknown");
-  rebuild_activity_list();
-  refresh_activity_key_options();
-  refresh_activity_keymap_binding_hint();
 }
 
 void SetupUi::refresh_activity_key_options() {
@@ -1512,21 +2402,38 @@ void SetupUi::refresh_activity_key_options() {
 
 void SetupUi::refresh_activity_keymap_device_dropdown() {
   if (dd_keymap_device_ == nullptr) return;
-  const std::vector<ActivityRecord>& activities = activity_registry_.all();
-  if (selected_activity_index_ < 0 || selected_activity_index_ >= static_cast<int>(activities.size())) return;
-  const ActivityRecord& activity = activities[selected_activity_index_];
+
+  std::string selected_before;
+  {
+    char selected_buf[80];
+    lv_dropdown_get_selected_str(dd_keymap_device_, selected_buf, sizeof(selected_buf));
+    selected_before = trim_copy(selected_buf);
+  }
+  const std::string filter = ta_keymap_device_filter_ != nullptr ? lower_copy(trim_copy(lv_textarea_get_text(ta_keymap_device_filter_))) : "";
 
   std::string options;
   keymap_device_ids_.clear();
-  for (size_t i = 0; i < activity.device_ids.size(); ++i) {
-    const DeviceRecord* d = device_registry_.get_by_id(activity.device_ids[i]);
+  const std::vector<DeviceRecord>& devices = device_registry_.all();
+  for (const DeviceRecord& device : devices) {
+    const DeviceRecord* d = &device;
     if (d == nullptr) continue;
+    if (!filter.empty() && lower_copy(d->name).find(filter) == std::string::npos) continue;
     if (!options.empty()) options += "\n";
     options += d->name;
     keymap_device_ids_.push_back(d->id);
   }
   if (options.empty()) options = "No devices";
   lv_dropdown_set_options(dd_keymap_device_, options.c_str());
+
+  if (!selected_before.empty()) {
+    for (uint16_t i = 0; i < keymap_device_ids_.size(); ++i) {
+      const DeviceRecord* d = device_registry_.get_by_id(keymap_device_ids_[i]);
+      if (d != nullptr && d->name == selected_before) {
+        lv_dropdown_set_selected(dd_keymap_device_, i);
+        break;
+      }
+    }
+  }
 }
 
 void SetupUi::refresh_activity_keymap_command_dropdown() {
@@ -1536,18 +2443,41 @@ void SetupUi::refresh_activity_keymap_command_dropdown() {
   if (selected_activity_index_ < 0 || selected_activity_index_ >= static_cast<int>(activities.size())) {
     return;
   }
+  std::string selected_before;
+  {
+    char selected_buf[80];
+    lv_dropdown_get_selected_str(dd_keymap_command_, selected_buf, sizeof(selected_buf));
+    selected_before = trim_copy(selected_buf);
+  }
   const uint16_t selected_idx = lv_dropdown_get_selected(dd_keymap_device_);
   const DeviceRecord* selected_device = (selected_idx < keymap_device_ids_.size()) ? device_registry_.get_by_id(keymap_device_ids_[selected_idx]) : nullptr;
+  const std::string filter = ta_keymap_command_filter_ != nullptr ? lower_copy(trim_copy(lv_textarea_get_text(ta_keymap_command_filter_))) : "";
 
   std::string options;
   if (selected_device != nullptr) {
     for (size_t i = 0; i < selected_device->commands.size(); ++i) {
-      if (i > 0) options += "\n";
-      options += selected_device->commands[i].name;
+      const std::string& command_name = selected_device->commands[i].name;
+      if (!filter.empty() && lower_copy(command_name).find(filter) == std::string::npos) continue;
+      if (!options.empty()) options += "\n";
+      options += command_name;
     }
   }
   if (options.empty()) options = "No commands";
   lv_dropdown_set_options(dd_keymap_command_, options.c_str());
+
+  if (!selected_before.empty() && selected_before != "No commands") {
+    uint16_t idx = 0;
+    if (selected_device != nullptr) {
+      for (const DeviceCommand& command : selected_device->commands) {
+        if (!filter.empty() && lower_copy(command.name).find(filter) == std::string::npos) continue;
+        if (command.name == selected_before) {
+          lv_dropdown_set_selected(dd_keymap_command_, idx);
+          break;
+        }
+        ++idx;
+      }
+    }
+  }
 }
 
 void SetupUi::refresh_activity_keymap_binding_hint() {
@@ -1577,6 +2507,152 @@ void SetupUi::refresh_activity_keymap_binding_hint() {
   lv_label_set_text(keymap_slot_hint_label_, "Current mapping: none");
 }
 
+void SetupUi::open_activity_keymap_overwrite_modal(const ActivityKeyBinding& existing_binding, uint32_t new_device_id,
+                                                   const std::string& new_command_name) {
+  if (activity_keymap_modal_ == nullptr) return;
+  close_activity_keymap_overwrite_modal();
+
+  pending_keymap_key_char_ = existing_binding.key_char;
+  pending_keymap_device_id_ = new_device_id;
+  pending_keymap_command_name_ = new_command_name;
+
+  const DeviceRecord* existing_device = device_registry_.get_by_id(existing_binding.device_id);
+  const DeviceRecord* new_device = device_registry_.get_by_id(new_device_id);
+
+  keymap_overwrite_modal_ = lv_obj_create(activity_keymap_modal_);
+  lv_obj_set_size(keymap_overwrite_modal_, SCR_WIDTH - 24, 148);
+  lv_obj_center(keymap_overwrite_modal_);
+  lv_obj_set_style_bg_color(keymap_overwrite_modal_, lv_color_hex(0x2A2A2A), LV_PART_MAIN);
+  lv_obj_set_style_pad_all(keymap_overwrite_modal_, 6, LV_PART_MAIN);
+
+  lv_obj_t* title = lv_label_create(keymap_overwrite_modal_);
+  lv_label_set_text(title, "Overwrite Mapping?");
+  lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 0);
+
+  lv_obj_t* body = lv_label_create(keymap_overwrite_modal_);
+  lv_obj_set_width(body, SCR_WIDTH - 40);
+  lv_label_set_long_mode(body, LV_LABEL_LONG_WRAP);
+  lv_label_set_text_fmt(body,
+                        "%c is mapped to %s (%s).\nReplace with %s (%s)?",
+                        existing_binding.key_char,
+                        existing_binding.command_name.c_str(),
+                        existing_device != nullptr ? existing_device->name.c_str() : "Unknown",
+                        new_command_name.c_str(),
+                        new_device != nullptr ? new_device->name.c_str() : "Unknown");
+  lv_obj_align(body, LV_ALIGN_TOP_LEFT, 0, 20);
+
+  lv_obj_t* cancel_btn = lv_btn_create(keymap_overwrite_modal_);
+  lv_obj_set_size(cancel_btn, (SCR_WIDTH - 38) / 2, 32);
+  lv_obj_align(cancel_btn, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+  lv_obj_add_event_cb(cancel_btn, on_activity_keymap_overwrite_cancel, LV_EVENT_CLICKED, this);
+  lv_obj_t* cancel_text = lv_label_create(cancel_btn);
+  lv_label_set_text(cancel_text, "Cancel");
+  lv_obj_center(cancel_text);
+
+  lv_obj_t* overwrite_btn = lv_btn_create(keymap_overwrite_modal_);
+  lv_obj_set_size(overwrite_btn, (SCR_WIDTH - 38) / 2, 32);
+  lv_obj_align(overwrite_btn, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
+  lv_obj_add_event_cb(overwrite_btn, on_activity_keymap_overwrite_confirm, LV_EVENT_CLICKED, this);
+  lv_obj_t* overwrite_text = lv_label_create(overwrite_btn);
+  lv_label_set_text(overwrite_text, "Overwrite");
+  lv_obj_center(overwrite_text);
+}
+
+void SetupUi::close_activity_keymap_overwrite_modal() {
+  if (keymap_overwrite_modal_ != nullptr) {
+    lv_obj_del(keymap_overwrite_modal_);
+    keymap_overwrite_modal_ = nullptr;
+  }
+  pending_keymap_key_char_ = '\0';
+  pending_keymap_device_id_ = 0;
+  pending_keymap_command_name_.clear();
+}
+
+void SetupUi::apply_activity_keymap_pending_overwrite() {
+  const std::vector<ActivityRecord>& activities = activity_registry_.all();
+  if (selected_activity_index_ < 0 || selected_activity_index_ >= static_cast<int>(activities.size())) return;
+  if (pending_keymap_key_char_ == '\0' || pending_keymap_device_id_ == 0 || pending_keymap_command_name_.empty()) return;
+
+  ActivityRecord updated = activities[selected_activity_index_];
+  bool replaced = false;
+  for (ActivityKeyBinding& binding : updated.key_bindings) {
+    if (binding.key_char == pending_keymap_key_char_) {
+      binding.device_id = pending_keymap_device_id_;
+      binding.command_name = pending_keymap_command_name_;
+      replaced = true;
+      break;
+    }
+  }
+  if (!replaced) {
+    ActivityKeyBinding binding;
+    binding.key_char = pending_keymap_key_char_;
+    binding.device_id = pending_keymap_device_id_;
+    binding.command_name = pending_keymap_command_name_;
+    updated.key_bindings.push_back(binding);
+  }
+  if (!activity_registry_.upsert(updated)) return;
+  rebuild_activity_list();
+  refresh_activity_key_options();
+  refresh_activity_keymap_device_dropdown();
+  refresh_activity_keymap_command_dropdown();
+  refresh_activity_keymap_binding_hint();
+  close_activity_keymap_overwrite_modal();
+}
+
+bool SetupUi::move_device_selection(int delta) {
+  if (selected_device_index_ < 0) return false;
+  std::vector<DeviceRecord> updated = device_registry_.all();
+  const int from = selected_device_index_;
+  const int to = from + delta;
+  if (to < 0 || to >= static_cast<int>(updated.size())) return false;
+  std::swap(updated[from], updated[to]);
+  if (!device_registry_.replace_all(std::move(updated))) return false;
+  selected_device_index_ = to;
+  rebuild_device_list();
+  return true;
+}
+
+bool SetupUi::move_activity_selection(int delta) {
+  if (selected_activity_index_ < 0) return false;
+  std::vector<ActivityRecord> updated = activity_registry_.all();
+  const int from = selected_activity_index_;
+  const int to = from + delta;
+  if (to < 0 || to >= static_cast<int>(updated.size())) return false;
+  std::swap(updated[from], updated[to]);
+  if (!activity_registry_.replace_all(std::move(updated))) return false;
+  selected_activity_index_ = to;
+  rebuild_activity_list();
+  rebuild_remote_activity_dropdown();
+  return true;
+}
+
+bool SetupUi::duplicate_selected_device() {
+  const DeviceRecord* device = selected_device();
+  if (device == nullptr) return false;
+
+  DeviceRecord copy = *device;
+  copy.id = 0;
+  copy.name = copy.name + " Copy";
+  if (!device_registry_.add(copy)) return false;
+  selected_device_index_ = static_cast<int>(device_registry_.count()) - 1;
+  rebuild_device_list();
+  rebuild_remote_activity_dropdown();
+  return true;
+}
+
+bool SetupUi::duplicate_selected_activity() {
+  const std::vector<ActivityRecord>& activities = activity_registry_.all();
+  if (selected_activity_index_ < 0 || selected_activity_index_ >= static_cast<int>(activities.size())) return false;
+  ActivityRecord copy = activities[selected_activity_index_];
+  copy.id = 0;
+  copy.name = copy.name + " Copy";
+  if (!activity_registry_.add(copy)) return false;
+  selected_activity_index_ = static_cast<int>(activity_registry_.count()) - 1;
+  rebuild_activity_list();
+  rebuild_remote_activity_dropdown();
+  return true;
+}
+
 void SetupUi::open_activity_builder_modal() {
   if (activity_builder_modal_ != nullptr) return;
   const std::vector<ActivityRecord>& activities = activity_registry_.all();
@@ -1603,12 +2679,11 @@ void SetupUi::open_activity_builder_modal() {
   lv_obj_align(dd_builder_device_, LV_ALIGN_TOP_LEFT, 0, 28);
   std::string device_options;
   activity_builder_device_ids_.clear();
-  for (uint32_t id : selected.device_ids) {
-    const DeviceRecord* device = device_registry_.get_by_id(id);
-    if (device == nullptr) continue;
+  const std::vector<DeviceRecord>& devices = device_registry_.all();
+  for (const DeviceRecord& device : devices) {
     if (!device_options.empty()) device_options += "\n";
-    device_options += device->name;
-    activity_builder_device_ids_.push_back(id);
+    device_options += device.name;
+    activity_builder_device_ids_.push_back(device.id);
   }
   if (device_options.empty()) device_options = "No devices";
   lv_dropdown_set_options(dd_builder_device_, device_options.c_str());
@@ -1677,7 +2752,7 @@ void SetupUi::close_activity_builder_modal() {
 void SetupUi::activity_builder_add_step() {
   if (dd_builder_device_ == nullptr || dd_builder_slot_ == nullptr || builder_status_label_ == nullptr) return;
   if (activity_builder_device_ids_.empty()) {
-    lv_label_set_text(builder_status_label_, "No devices in activity");
+    lv_label_set_text(builder_status_label_, "No devices available");
     return;
   }
 
@@ -1854,11 +2929,115 @@ void SetupUi::perform_sd_restore() {
   rebuild_device_list();
   rebuild_activity_list();
   rebuild_remote_activity_dropdown();
+  save_ui_context();
   close_sd_restore_modal();
   if (normalized) {
     status += " (normalized)";
   }
   if (settings_status_ != nullptr) lv_label_set_text(settings_status_, status.c_str());
+}
+
+void SetupUi::open_power_modal() {
+  if (power_modal_ != nullptr) return;
+
+  power_modal_ = lv_obj_create(root_);
+  lv_obj_set_size(power_modal_, SCR_WIDTH, SCR_HEIGHT);
+  lv_obj_center(power_modal_);
+  lv_obj_set_style_bg_color(power_modal_, lv_color_hex(0x202020), LV_PART_MAIN);
+  lv_obj_set_style_pad_all(power_modal_, 6, LV_PART_MAIN);
+
+  lv_obj_t* title = lv_label_create(power_modal_);
+  lv_label_set_text(title, "Power Settings");
+  lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 6);
+
+  lv_obj_t* timeout_label = lv_label_create(power_modal_);
+  lv_label_set_text(timeout_label, "Sleep timeout");
+  lv_obj_align(timeout_label, LV_ALIGN_TOP_LEFT, 0, 30);
+
+  dd_power_sleep_timeout_ = lv_dropdown_create(power_modal_);
+  lv_obj_set_width(dd_power_sleep_timeout_, SCR_WIDTH - 12);
+  lv_obj_align(dd_power_sleep_timeout_, LV_ALIGN_TOP_LEFT, 0, 48);
+  lv_dropdown_set_options(dd_power_sleep_timeout_, sleep_timeout_dropdown_options().c_str());
+  lv_dropdown_set_selected(dd_power_sleep_timeout_, sleep_timeout_index_for_value(get_sleepTimeout_HAL()));
+
+  lv_obj_t* debounce_label = lv_label_create(power_modal_);
+  lv_label_set_text(debounce_label, "Command debounce");
+  lv_obj_align(debounce_label, LV_ALIGN_TOP_LEFT, 0, 86);
+
+  dd_power_debounce_ = lv_dropdown_create(power_modal_);
+  lv_obj_set_width(dd_power_debounce_, SCR_WIDTH - 12);
+  lv_obj_align(dd_power_debounce_, LV_ALIGN_TOP_LEFT, 0, 104);
+  lv_dropdown_set_options(dd_power_debounce_, debounce_dropdown_options().c_str());
+  lv_dropdown_set_selected(dd_power_debounce_, debounce_index_for_value(dispatcher_.debounce_interval_ms()));
+
+  lv_obj_t* wake_label = lv_label_create(power_modal_);
+  lv_label_set_text(wake_label, "Lift to wake (motion)");
+  lv_obj_align(wake_label, LV_ALIGN_TOP_LEFT, 0, 142);
+
+  sw_power_wakeup_imu_ = lv_switch_create(power_modal_);
+  lv_obj_align(sw_power_wakeup_imu_, LV_ALIGN_TOP_RIGHT, 0, 138);
+  if (get_wakeupByIMUEnabled_HAL()) {
+    lv_obj_add_state(sw_power_wakeup_imu_, LV_STATE_CHECKED);
+  } else {
+    lv_obj_clear_state(sw_power_wakeup_imu_, LV_STATE_CHECKED);
+  }
+
+  lv_obj_t* note = lv_label_create(power_modal_);
+  lv_obj_set_width(note, SCR_WIDTH - 12);
+  lv_label_set_long_mode(note, LV_LABEL_LONG_WRAP);
+  lv_label_set_text(note, "Changes are persisted and used after reboot/wake.");
+  lv_obj_align(note, LV_ALIGN_TOP_LEFT, 0, 176);
+
+  lv_obj_t* close_btn = lv_btn_create(power_modal_);
+  lv_obj_set_size(close_btn, (SCR_WIDTH - 18) / 2, 32);
+  lv_obj_align(close_btn, LV_ALIGN_TOP_LEFT, 0, 206);
+  lv_obj_add_event_cb(close_btn, on_power_modal_close, LV_EVENT_CLICKED, this);
+  lv_obj_t* close_text = lv_label_create(close_btn);
+  lv_label_set_text(close_text, "Close");
+  lv_obj_center(close_text);
+
+  lv_obj_t* apply_btn = lv_btn_create(power_modal_);
+  lv_obj_set_size(apply_btn, (SCR_WIDTH - 18) / 2, 32);
+  lv_obj_align(apply_btn, LV_ALIGN_TOP_RIGHT, 0, 206);
+  lv_obj_add_event_cb(apply_btn, on_power_modal_apply, LV_EVENT_CLICKED, this);
+  lv_obj_t* apply_text = lv_label_create(apply_btn);
+  lv_label_set_text(apply_text, "Apply");
+  lv_obj_center(apply_text);
+}
+
+void SetupUi::close_power_modal() {
+  if (power_modal_ == nullptr) return;
+  lv_obj_del(power_modal_);
+  power_modal_ = nullptr;
+  dd_power_sleep_timeout_ = nullptr;
+  dd_power_debounce_ = nullptr;
+  sw_power_wakeup_imu_ = nullptr;
+}
+
+bool SetupUi::apply_power_modal() {
+  if (dd_power_sleep_timeout_ == nullptr || dd_power_debounce_ == nullptr || sw_power_wakeup_imu_ == nullptr) return false;
+  const uint16_t timeout_index = lv_dropdown_get_selected(dd_power_sleep_timeout_);
+  const uint32_t timeout_ms = sleep_timeout_value_for_index(timeout_index);
+  const uint16_t debounce_index = lv_dropdown_get_selected(dd_power_debounce_);
+  const unsigned long debounce_ms = debounce_value_for_index(debounce_index);
+  const bool wake_by_imu = lv_obj_has_state(sw_power_wakeup_imu_, LV_STATE_CHECKED);
+
+  set_sleepTimeout_HAL(timeout_ms);
+  set_wakeupByIMUEnabled_HAL(wake_by_imu);
+  dispatcher_.set_debounce_interval_ms(debounce_ms);
+  const bool debounce_saved = save_debounce_interval_setting(debounce_ms);
+  save_preferences_HAL();
+  setLastActivityTimestamp_HAL();
+  update_status_bar();
+
+  if (settings_status_ != nullptr) {
+    lv_label_set_text_fmt(settings_status_, "Power updated: %lu sec timeout, debounce %lums, lift-to-wake %s%s",
+                          static_cast<unsigned long>(timeout_ms / 1000),
+                          debounce_ms,
+                          wake_by_imu ? "on" : "off",
+                          debounce_saved ? "" : " (debounce save failed)");
+  }
+  return true;
 }
 
 bool SetupUi::remove_device_references_from_activities(uint32_t device_id) {
@@ -2378,6 +3557,286 @@ void SetupUi::forget_wifi_credentials() {
 #endif
 }
 
+void SetupUi::open_ble_modal() {
+  if (ble_modal_ != nullptr) return;
+
+  ble_modal_ = lv_obj_create(root_);
+  lv_obj_set_size(ble_modal_, SCR_WIDTH, SCR_HEIGHT);
+  lv_obj_center(ble_modal_);
+  lv_obj_set_style_bg_color(ble_modal_, lv_color_hex(0x202020), LV_PART_MAIN);
+  lv_obj_set_style_pad_all(ble_modal_, 6, LV_PART_MAIN);
+
+  lv_obj_t* title = lv_label_create(ble_modal_);
+  lv_label_set_text(title, "BLE Settings");
+  lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 6);
+
+  const int bw = (SCR_WIDTH - 18) / 2;
+  const int bh = 32;
+
+  lv_obj_t* advertise_btn = lv_btn_create(ble_modal_);
+  lv_obj_set_size(advertise_btn, bw, bh);
+  lv_obj_align(advertise_btn, LV_ALIGN_TOP_LEFT, 0, 32);
+  lv_obj_add_event_cb(advertise_btn, on_ble_modal_advertise, LV_EVENT_CLICKED, this);
+  lv_obj_t* advertise_text = lv_label_create(advertise_btn);
+  lv_label_set_text(advertise_text, "Advertise");
+  lv_obj_center(advertise_text);
+
+  lv_obj_t* stop_btn = lv_btn_create(ble_modal_);
+  lv_obj_set_size(stop_btn, bw, bh);
+  lv_obj_align(stop_btn, LV_ALIGN_TOP_RIGHT, 0, 32);
+  lv_obj_add_event_cb(stop_btn, on_ble_modal_stop, LV_EVENT_CLICKED, this);
+  lv_obj_t* stop_text = lv_label_create(stop_btn);
+  lv_label_set_text(stop_text, "Stop");
+  lv_obj_center(stop_text);
+
+  lv_obj_t* disconnect_btn = lv_btn_create(ble_modal_);
+  lv_obj_set_size(disconnect_btn, bw, bh);
+  lv_obj_align(disconnect_btn, LV_ALIGN_TOP_LEFT, 0, 68);
+  lv_obj_add_event_cb(disconnect_btn, on_ble_modal_disconnect, LV_EVENT_CLICKED, this);
+  lv_obj_t* disconnect_text = lv_label_create(disconnect_btn);
+  lv_label_set_text(disconnect_text, "Disconnect");
+  lv_obj_center(disconnect_text);
+
+  lv_obj_t* list_bonds_btn = lv_btn_create(ble_modal_);
+  lv_obj_set_size(list_bonds_btn, bw, bh);
+  lv_obj_align(list_bonds_btn, LV_ALIGN_TOP_RIGHT, 0, 68);
+  lv_obj_add_event_cb(list_bonds_btn, on_ble_modal_list_bonds, LV_EVENT_CLICKED, this);
+  lv_obj_t* list_bonds_text = lv_label_create(list_bonds_btn);
+  lv_label_set_text(list_bonds_text, "List Bonds");
+  lv_obj_center(list_bonds_text);
+
+  lv_obj_t* clear_bonds_btn = lv_btn_create(ble_modal_);
+  lv_obj_set_size(clear_bonds_btn, SCR_WIDTH - 12, bh);
+  lv_obj_align(clear_bonds_btn, LV_ALIGN_TOP_LEFT, 0, 104);
+  lv_obj_add_event_cb(clear_bonds_btn, on_ble_modal_clear_bonds, LV_EVENT_CLICKED, this);
+  lv_obj_t* clear_bonds_text = lv_label_create(clear_bonds_btn);
+  lv_label_set_text(clear_bonds_text, "Clear Bonds");
+  lv_obj_center(clear_bonds_text);
+
+  lv_obj_t* close_btn = lv_btn_create(ble_modal_);
+  lv_obj_set_size(close_btn, SCR_WIDTH - 12, bh);
+  lv_obj_align(close_btn, LV_ALIGN_TOP_LEFT, 0, 140);
+  lv_obj_add_event_cb(close_btn, on_ble_modal_close, LV_EVENT_CLICKED, this);
+  lv_obj_t* close_text = lv_label_create(close_btn);
+  lv_label_set_text(close_text, "Close");
+  lv_obj_center(close_text);
+
+  ble_modal_status_ = lv_label_create(ble_modal_);
+  lv_obj_set_width(ble_modal_status_, SCR_WIDTH - 12);
+  lv_label_set_long_mode(ble_modal_status_, LV_LABEL_LONG_WRAP);
+  lv_label_set_text(ble_modal_status_, "BLE status");
+  lv_obj_align(ble_modal_status_, LV_ALIGN_TOP_LEFT, 0, 178);
+
+  refresh_ble_modal_status();
+}
+
+void SetupUi::close_ble_modal() {
+  if (ble_modal_ == nullptr) return;
+  lv_obj_del(ble_modal_);
+  ble_modal_ = nullptr;
+  ble_modal_status_ = nullptr;
+}
+
+void SetupUi::refresh_ble_modal_status() {
+  if (ble_modal_status_ == nullptr) return;
+#if (ENABLE_KEYBOARD_BLE == 1)
+  const bool connected = keyboardBLE_isConnected_HAL();
+  const bool advertising = keyboardBLE_isAdvertising_HAL();
+  if (connected) {
+    lv_label_set_text(ble_modal_status_, "BLE connected");
+  } else if (advertising) {
+    lv_label_set_text(ble_modal_status_, "BLE advertising");
+  } else {
+    lv_label_set_text(ble_modal_status_, "BLE idle");
+  }
+#else
+  lv_label_set_text(ble_modal_status_, "BLE not enabled in this firmware. Build/flash omote-v2-esp32-s3.");
+#endif
+}
+
+void SetupUi::open_mqtt_modal() {
+  if (mqtt_modal_ != nullptr) return;
+
+  mqtt_modal_ = lv_obj_create(root_);
+  lv_obj_set_size(mqtt_modal_, SCR_WIDTH, SCR_HEIGHT);
+  lv_obj_center(mqtt_modal_);
+  lv_obj_set_style_bg_color(mqtt_modal_, lv_color_hex(0x202020), LV_PART_MAIN);
+  lv_obj_set_style_pad_all(mqtt_modal_, 6, LV_PART_MAIN);
+  lv_obj_set_scroll_dir(mqtt_modal_, LV_DIR_VER);
+  lv_obj_set_style_pad_bottom(mqtt_modal_, 148, LV_PART_MAIN);
+
+  lv_obj_t* title = lv_label_create(mqtt_modal_);
+  lv_label_set_text(title, "MQTT Settings");
+  lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 6);
+
+  ta_mqtt_host_ = lv_textarea_create(mqtt_modal_);
+  lv_textarea_set_one_line(ta_mqtt_host_, true);
+  lv_textarea_set_placeholder_text(ta_mqtt_host_, "Broker host/IP");
+  lv_obj_set_width(ta_mqtt_host_, SCR_WIDTH - 12);
+  lv_obj_align(ta_mqtt_host_, LV_ALIGN_TOP_LEFT, 0, 28);
+  lv_obj_add_event_cb(ta_mqtt_host_, on_textarea_focus, LV_EVENT_FOCUSED, this);
+
+  ta_mqtt_port_ = lv_textarea_create(mqtt_modal_);
+  lv_textarea_set_one_line(ta_mqtt_port_, true);
+  lv_textarea_set_placeholder_text(ta_mqtt_port_, "Port (e.g. 1883)");
+  lv_obj_set_width(ta_mqtt_port_, SCR_WIDTH - 12);
+  lv_obj_align(ta_mqtt_port_, LV_ALIGN_TOP_LEFT, 0, 58);
+  lv_obj_add_event_cb(ta_mqtt_port_, on_textarea_focus, LV_EVENT_FOCUSED, this);
+
+  ta_mqtt_user_ = lv_textarea_create(mqtt_modal_);
+  lv_textarea_set_one_line(ta_mqtt_user_, true);
+  lv_textarea_set_placeholder_text(ta_mqtt_user_, "Username (optional)");
+  lv_obj_set_width(ta_mqtt_user_, SCR_WIDTH - 12);
+  lv_obj_align(ta_mqtt_user_, LV_ALIGN_TOP_LEFT, 0, 88);
+  lv_obj_add_event_cb(ta_mqtt_user_, on_textarea_focus, LV_EVENT_FOCUSED, this);
+
+  ta_mqtt_pass_ = lv_textarea_create(mqtt_modal_);
+  lv_textarea_set_one_line(ta_mqtt_pass_, true);
+  lv_textarea_set_password_mode(ta_mqtt_pass_, true);
+  lv_textarea_set_placeholder_text(ta_mqtt_pass_, "Password (optional)");
+  lv_obj_set_width(ta_mqtt_pass_, SCR_WIDTH - 12);
+  lv_obj_align(ta_mqtt_pass_, LV_ALIGN_TOP_LEFT, 0, 118);
+  lv_obj_add_event_cb(ta_mqtt_pass_, on_textarea_focus, LV_EVENT_FOCUSED, this);
+
+  ta_mqtt_client_ = lv_textarea_create(mqtt_modal_);
+  lv_textarea_set_one_line(ta_mqtt_client_, true);
+  lv_textarea_set_placeholder_text(ta_mqtt_client_, "Client name (optional)");
+  lv_obj_set_width(ta_mqtt_client_, SCR_WIDTH - 12);
+  lv_obj_align(ta_mqtt_client_, LV_ALIGN_TOP_LEFT, 0, 148);
+  lv_obj_add_event_cb(ta_mqtt_client_, on_textarea_focus, LV_EVENT_FOCUSED, this);
+
+  lv_obj_t* close_btn = lv_btn_create(mqtt_modal_);
+  lv_obj_set_size(close_btn, (SCR_WIDTH - 24) / 3, 32);
+  lv_obj_align(close_btn, LV_ALIGN_TOP_LEFT, 0, 182);
+  lv_obj_add_event_cb(close_btn, on_mqtt_modal_close, LV_EVENT_CLICKED, this);
+  lv_obj_t* close_text = lv_label_create(close_btn);
+  lv_label_set_text(close_text, "Close");
+  lv_obj_center(close_text);
+
+  lv_obj_t* save_btn = lv_btn_create(mqtt_modal_);
+  lv_obj_set_size(save_btn, (SCR_WIDTH - 24) / 3, 32);
+  lv_obj_align(save_btn, LV_ALIGN_TOP_MID, 0, 182);
+  lv_obj_add_event_cb(save_btn, on_mqtt_modal_save, LV_EVENT_CLICKED, this);
+  lv_obj_t* save_text = lv_label_create(save_btn);
+  lv_label_set_text(save_text, "Save");
+  lv_obj_center(save_text);
+
+  lv_obj_t* clear_btn = lv_btn_create(mqtt_modal_);
+  lv_obj_set_size(clear_btn, (SCR_WIDTH - 24) / 3, 32);
+  lv_obj_align(clear_btn, LV_ALIGN_TOP_RIGHT, 0, 182);
+  lv_obj_add_event_cb(clear_btn, on_mqtt_modal_clear, LV_EVENT_CLICKED, this);
+  lv_obj_t* clear_text = lv_label_create(clear_btn);
+  lv_label_set_text(clear_text, "Clear");
+  lv_obj_center(clear_text);
+
+  mqtt_modal_status_ = lv_label_create(mqtt_modal_);
+  lv_obj_set_width(mqtt_modal_status_, SCR_WIDTH - 12);
+  lv_label_set_long_mode(mqtt_modal_status_, LV_LABEL_LONG_WRAP);
+  lv_label_set_text(mqtt_modal_status_, "Configure broker and save.");
+  lv_obj_align(mqtt_modal_status_, LV_ALIGN_TOP_LEFT, 0, 220);
+
+  std::string host;
+  uint16_t port = 0;
+  std::string user;
+  std::string pass;
+  std::string client_name;
+  if (mqtt_get_broker_config_HAL(&host, &port, &user, &pass, &client_name)) {
+    lv_textarea_set_text(ta_mqtt_host_, host.c_str());
+    if (port > 0) {
+      char port_buf[16];
+      snprintf(port_buf, sizeof(port_buf), "%u", static_cast<unsigned>(port));
+      lv_textarea_set_text(ta_mqtt_port_, port_buf);
+    }
+    lv_textarea_set_text(ta_mqtt_user_, user.c_str());
+    lv_textarea_set_text(ta_mqtt_pass_, pass.c_str());
+    lv_textarea_set_text(ta_mqtt_client_, client_name.c_str());
+  }
+  if (mqtt_modal_status_ != nullptr) {
+    lv_label_set_text(mqtt_modal_status_,
+                      mqtt_is_configured_HAL() ? (mqtt_is_connected_HAL() ? "MQTT connected" : "MQTT configured")
+                                               : "MQTT not configured");
+  }
+
+  keyboard_ = lv_keyboard_create(root_);
+  lv_obj_set_size(keyboard_, SCR_WIDTH, 128);
+  lv_obj_align(keyboard_, LV_ALIGN_BOTTOM_MID, 0, 0);
+  lv_obj_add_flag(keyboard_, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_event_cb(keyboard_, on_keyboard_apply, LV_EVENT_READY, this);
+}
+
+void SetupUi::close_mqtt_modal() {
+  if (mqtt_modal_ == nullptr) return;
+  lv_obj_del(mqtt_modal_);
+  mqtt_modal_ = nullptr;
+  ta_mqtt_host_ = nullptr;
+  ta_mqtt_port_ = nullptr;
+  ta_mqtt_user_ = nullptr;
+  ta_mqtt_pass_ = nullptr;
+  ta_mqtt_client_ = nullptr;
+  mqtt_modal_status_ = nullptr;
+  if (keyboard_ != nullptr) {
+    lv_obj_del(keyboard_);
+    keyboard_ = nullptr;
+  }
+}
+
+bool SetupUi::apply_mqtt_modal() {
+  if (ta_mqtt_host_ == nullptr || ta_mqtt_port_ == nullptr || ta_mqtt_user_ == nullptr ||
+      ta_mqtt_pass_ == nullptr || ta_mqtt_client_ == nullptr) {
+    return false;
+  }
+  const std::string host = trim_copy(lv_textarea_get_text(ta_mqtt_host_));
+  const std::string port_text = trim_copy(lv_textarea_get_text(ta_mqtt_port_));
+  const std::string user = lv_textarea_get_text(ta_mqtt_user_);
+  const std::string pass = lv_textarea_get_text(ta_mqtt_pass_);
+  const std::string client_name = trim_copy(lv_textarea_get_text(ta_mqtt_client_));
+
+  if (host.empty()) {
+    if (mqtt_modal_status_ != nullptr) lv_label_set_text(mqtt_modal_status_, "Host is required");
+    return false;
+  }
+  if (!parse_u32_token(port_text)) {
+    if (mqtt_modal_status_ != nullptr) lv_label_set_text(mqtt_modal_status_, "Port must be numeric");
+    return false;
+  }
+  const uint32_t parsed_port = strtoul(port_text.c_str(), nullptr, 10);
+  if (parsed_port == 0 || parsed_port > 65535) {
+    if (mqtt_modal_status_ != nullptr) lv_label_set_text(mqtt_modal_status_, "Port must be 1-65535");
+    return false;
+  }
+
+  if (!mqtt_set_broker_config_HAL(host, static_cast<uint16_t>(parsed_port), user, pass, client_name)) {
+    if (mqtt_modal_status_ != nullptr) lv_label_set_text(mqtt_modal_status_, "Failed to save MQTT settings");
+    return false;
+  }
+
+  mqtt_loop_HAL();
+  const bool connected = mqtt_is_connected_HAL();
+  if (mqtt_modal_status_ != nullptr) {
+    lv_label_set_text(mqtt_modal_status_, connected ? "MQTT connected" : "MQTT saved (connecting...)");
+  }
+  if (settings_status_ != nullptr) {
+    lv_label_set_text_fmt(settings_status_, connected ? "MQTT connected: %s:%u" : "MQTT saved: %s:%u",
+                          host.c_str(), static_cast<unsigned>(parsed_port));
+  }
+  return true;
+}
+
+bool SetupUi::clear_mqtt_modal() {
+  if (!mqtt_clear_broker_config_HAL()) {
+    if (mqtt_modal_status_ != nullptr) lv_label_set_text(mqtt_modal_status_, "Failed to clear MQTT settings");
+    return false;
+  }
+  if (ta_mqtt_host_ != nullptr) lv_textarea_set_text(ta_mqtt_host_, "");
+  if (ta_mqtt_port_ != nullptr) lv_textarea_set_text(ta_mqtt_port_, "");
+  if (ta_mqtt_user_ != nullptr) lv_textarea_set_text(ta_mqtt_user_, "");
+  if (ta_mqtt_pass_ != nullptr) lv_textarea_set_text(ta_mqtt_pass_, "");
+  if (ta_mqtt_client_ != nullptr) lv_textarea_set_text(ta_mqtt_client_, "");
+  if (mqtt_modal_status_ != nullptr) lv_label_set_text(mqtt_modal_status_, "MQTT settings cleared");
+  if (settings_status_ != nullptr) lv_label_set_text(settings_status_, "MQTT settings cleared");
+  return true;
+}
+
 void SetupUi::dispatch_remote_command(CommandSlot slot) {
   const ActivityRecord* activity = selected_activity();
   if (activity == nullptr) {
@@ -2388,7 +3847,7 @@ void SetupUi::dispatch_remote_command(CommandSlot slot) {
   if (sent) {
     lv_label_set_text_fmt(remote_status_, "Sent: %s", to_string(slot));
   } else {
-    lv_label_set_text_fmt(remote_status_, "No mapping: %s", to_string(slot));
+    lv_label_set_text_fmt(remote_status_, "%s: %s", to_string(slot), dispatcher_.last_status().c_str());
   }
 }
 
@@ -2398,12 +3857,19 @@ void SetupUi::dispatch_physical_key(char key_char) {
   for (const ActivityKeyBinding& binding : activity->key_bindings) {
     if (binding.key_char == key_char) {
       if (binding.device_id != 0 && !binding.command_name.empty()) {
-        dispatcher_.dispatch_device_command(binding.device_id, binding.command_name);
+        const bool sent = dispatcher_.dispatch_device_command(binding.device_id, binding.command_name);
         if (remote_status_ != nullptr) {
           const DeviceRecord* device = device_registry_.get_by_id(binding.device_id);
-          lv_label_set_text_fmt(remote_status_, "Sent: %s (%s)",
-                                binding.command_name.c_str(),
-                                device != nullptr ? device->name.c_str() : "Unknown");
+          if (sent) {
+            lv_label_set_text_fmt(remote_status_, "Sent: %s (%s)",
+                                  binding.command_name.c_str(),
+                                  device != nullptr ? device->name.c_str() : "Unknown");
+          } else {
+            lv_label_set_text_fmt(remote_status_, "Failed: %s (%s): %s",
+                                  binding.command_name.c_str(),
+                                  device != nullptr ? device->name.c_str() : "Unknown",
+                                  dispatcher_.last_status().c_str());
+          }
         }
       } else if (!binding.command_name.empty()) {
         CommandSlot slot;
@@ -2428,9 +3894,14 @@ const DeviceRecord* SetupUi::selected_device() const {
 
 const ActivityRecord* SetupUi::selected_activity() const {
   const std::vector<ActivityRecord>& activities = activity_registry_.all();
-  int current = lv_dropdown_get_selected(remote_activity_dd_);
-  if (current < 0 || current >= static_cast<int>(activities.size())) return nullptr;
-  return &activities[current];
+  if (selected_activity_index_ < 0 || selected_activity_index_ >= static_cast<int>(activities.size())) return nullptr;
+  return &activities[selected_activity_index_];
+}
+
+void SetupUi::on_tabview_changed(lv_event_t* event) {
+  SetupUi* self = static_cast<SetupUi*>(lv_event_get_user_data(event));
+  if (self == nullptr) return;
+  self->save_ui_context();
 }
 
 void SetupUi::on_device_add_clicked(lv_event_t* event) {
@@ -2467,6 +3938,36 @@ void SetupUi::on_device_rename_clicked(lv_event_t* event) {
   self->open_rename_modal(false);
 }
 
+void SetupUi::on_device_duplicate_clicked(lv_event_t* event) {
+  SetupUi* self = static_cast<SetupUi*>(lv_event_get_user_data(event));
+  if (self == nullptr) return;
+  if (self->duplicate_selected_device()) {
+    lv_label_set_text(self->selected_device_label_, "Duplicated selected device");
+  } else {
+    lv_label_set_text(self->selected_device_label_, "Duplicate failed: select a device");
+  }
+}
+
+void SetupUi::on_device_move_up_clicked(lv_event_t* event) {
+  SetupUi* self = static_cast<SetupUi*>(lv_event_get_user_data(event));
+  if (self == nullptr) return;
+  if (self->move_device_selection(-1)) {
+    lv_label_set_text(self->selected_device_label_, "Moved device up");
+  } else {
+    lv_label_set_text(self->selected_device_label_, "Move up unavailable");
+  }
+}
+
+void SetupUi::on_device_move_down_clicked(lv_event_t* event) {
+  SetupUi* self = static_cast<SetupUi*>(lv_event_get_user_data(event));
+  if (self == nullptr) return;
+  if (self->move_device_selection(1)) {
+    lv_label_set_text(self->selected_device_label_, "Moved device down");
+  } else {
+    lv_label_set_text(self->selected_device_label_, "Move down unavailable");
+  }
+}
+
 void SetupUi::on_device_clicked(lv_event_t* event) {
   SetupUi* self = static_cast<SetupUi*>(lv_event_get_user_data(event));
   if (self == nullptr) return;
@@ -2478,6 +3979,10 @@ void SetupUi::on_device_clicked(lv_event_t* event) {
     }
   }
   self->rebuild_device_list();
+  if (self->remote_activity_dd_ != nullptr && self->selected_device_index_ >= 0) {
+    lv_dropdown_set_selected(self->remote_activity_dd_, static_cast<uint16_t>(self->selected_device_index_));
+  }
+  self->rebuild_remote_command_buttons();
 }
 
 void SetupUi::on_device_modal_close(lv_event_t* event) {
@@ -2540,6 +4045,18 @@ void SetupUi::on_command_modal_learn(lv_event_t* event) {
   self->start_ir_learning();
 }
 
+void SetupUi::on_command_transport_changed(lv_event_t* event) {
+  SetupUi* self = static_cast<SetupUi*>(lv_event_get_user_data(event));
+  if (self == nullptr) return;
+  self->refresh_command_modal_transport_ui();
+}
+
+void SetupUi::on_command_template_apply(lv_event_t* event) {
+  SetupUi* self = static_cast<SetupUi*>(lv_event_get_user_data(event));
+  if (self == nullptr) return;
+  self->apply_command_template();
+}
+
 void SetupUi::on_command_name_changed(lv_event_t* event) {
   SetupUi* self = static_cast<SetupUi*>(lv_event_get_user_data(event));
   if (self == nullptr) return;
@@ -2599,11 +4116,15 @@ void SetupUi::on_activity_clicked(lv_event_t* event) {
       break;
     }
   }
-  const std::vector<ActivityRecord>& activities = self->activity_registry_.all();
-  if (self->selected_activity_index_ >= 0 && self->selected_activity_index_ < static_cast<int>(activities.size())) {
-    lv_dropdown_set_selected(self->remote_activity_dd_, static_cast<uint16_t>(self->selected_activity_index_));
-  }
   self->rebuild_activity_list();
+  const ActivityRecord* activity = self->selected_activity();
+  if (activity != nullptr) {
+    self->execute_activity_startup_actions(*activity);
+    if (self->remote_status_ != nullptr) {
+      lv_label_set_text_fmt(self->remote_status_, "Activity: %s", activity->name.c_str());
+    }
+  }
+  self->save_ui_context();
 }
 
 void SetupUi::on_activity_add_clicked(lv_event_t* event) {
@@ -2619,12 +4140,46 @@ void SetupUi::on_activity_remove_clicked(lv_event_t* event) {
   self->selected_activity_index_ = -1;
   self->rebuild_activity_list();
   self->rebuild_remote_activity_dropdown();
+  self->save_ui_context();
 }
 
 void SetupUi::on_activity_rename_clicked(lv_event_t* event) {
   SetupUi* self = static_cast<SetupUi*>(lv_event_get_user_data(event));
   if (self == nullptr) return;
   self->open_rename_modal(true);
+}
+
+void SetupUi::on_activity_duplicate_clicked(lv_event_t* event) {
+  SetupUi* self = static_cast<SetupUi*>(lv_event_get_user_data(event));
+  if (self == nullptr) return;
+  if (self->duplicate_selected_activity()) {
+    lv_label_set_text(self->selected_activity_label_, "Duplicated selected activity");
+    self->save_ui_context();
+  } else {
+    lv_label_set_text(self->selected_activity_label_, "Duplicate failed: select an activity");
+  }
+}
+
+void SetupUi::on_activity_move_up_clicked(lv_event_t* event) {
+  SetupUi* self = static_cast<SetupUi*>(lv_event_get_user_data(event));
+  if (self == nullptr) return;
+  if (self->move_activity_selection(-1)) {
+    lv_label_set_text(self->selected_activity_label_, "Moved activity up");
+    self->save_ui_context();
+  } else {
+    lv_label_set_text(self->selected_activity_label_, "Move up unavailable");
+  }
+}
+
+void SetupUi::on_activity_move_down_clicked(lv_event_t* event) {
+  SetupUi* self = static_cast<SetupUi*>(lv_event_get_user_data(event));
+  if (self == nullptr) return;
+  if (self->move_activity_selection(1)) {
+    lv_label_set_text(self->selected_activity_label_, "Moved activity down");
+    self->save_ui_context();
+  } else {
+    lv_label_set_text(self->selected_activity_label_, "Move down unavailable");
+  }
 }
 
 void SetupUi::on_activity_modal_close(lv_event_t* event) {
@@ -2637,6 +4192,7 @@ void SetupUi::on_activity_modal_save(lv_event_t* event) {
   SetupUi* self = static_cast<SetupUi*>(lv_event_get_user_data(event));
   if (self == nullptr) return;
   if (self->save_activity_modal()) {
+    self->save_ui_context();
     self->close_activity_modal();
   }
 }
@@ -2676,6 +4232,44 @@ void SetupUi::on_activity_keymap_command_changed(lv_event_t* event) {
   SetupUi* self = static_cast<SetupUi*>(lv_event_get_user_data(event));
   if (self == nullptr) return;
   self->refresh_activity_keymap_binding_hint();
+}
+
+void SetupUi::on_activity_keymap_device_filter_changed(lv_event_t* event) {
+  SetupUi* self = static_cast<SetupUi*>(lv_event_get_user_data(event));
+  if (self == nullptr) return;
+  self->refresh_activity_keymap_device_dropdown();
+  self->refresh_activity_keymap_command_dropdown();
+  self->refresh_activity_keymap_binding_hint();
+}
+
+void SetupUi::on_activity_keymap_command_filter_changed(lv_event_t* event) {
+  SetupUi* self = static_cast<SetupUi*>(lv_event_get_user_data(event));
+  if (self == nullptr) return;
+  self->refresh_activity_keymap_command_dropdown();
+  self->refresh_activity_keymap_binding_hint();
+}
+
+void SetupUi::on_activity_keymap_overwrite_cancel(lv_event_t* event) {
+  SetupUi* self = static_cast<SetupUi*>(lv_event_get_user_data(event));
+  if (self == nullptr) return;
+  self->close_activity_keymap_overwrite_modal();
+  if (self->keymap_status_label_ != nullptr) {
+    lv_label_set_text(self->keymap_status_label_, "Mapping unchanged");
+  }
+}
+
+void SetupUi::on_activity_keymap_overwrite_confirm(lv_event_t* event) {
+  SetupUi* self = static_cast<SetupUi*>(lv_event_get_user_data(event));
+  if (self == nullptr) return;
+  const char key_char = self->pending_keymap_key_char_;
+  const uint32_t device_id = self->pending_keymap_device_id_;
+  const std::string command_name = self->pending_keymap_command_name_;
+  self->apply_activity_keymap_pending_overwrite();
+  if (self->keymap_status_label_ != nullptr) {
+    const DeviceRecord* device = self->device_registry_.get_by_id(device_id);
+    lv_label_set_text_fmt(self->keymap_status_label_, "Overwrote: %c -> %s (%s)", key_char, command_name.c_str(),
+                          device != nullptr ? device->name.c_str() : "Unknown");
+  }
 }
 
 void SetupUi::on_activity_builder_close(lv_event_t* event) {
@@ -2732,10 +4326,28 @@ void SetupUi::on_settings_wifi_clicked(lv_event_t* event) {
   self->open_wifi_modal();
 }
 
+void SetupUi::on_settings_ble_clicked(lv_event_t* event) {
+  SetupUi* self = static_cast<SetupUi*>(lv_event_get_user_data(event));
+  if (self == nullptr) return;
+  self->open_ble_modal();
+}
+
+void SetupUi::on_settings_mqtt_clicked(lv_event_t* event) {
+  SetupUi* self = static_cast<SetupUi*>(lv_event_get_user_data(event));
+  if (self == nullptr) return;
+  self->open_mqtt_modal();
+}
+
 void SetupUi::on_settings_set_time_clicked(lv_event_t* event) {
   SetupUi* self = static_cast<SetupUi*>(lv_event_get_user_data(event));
   if (self == nullptr) return;
   self->open_manual_time_modal();
+}
+
+void SetupUi::on_settings_power_clicked(lv_event_t* event) {
+  SetupUi* self = static_cast<SetupUi*>(lv_event_get_user_data(event));
+  if (self == nullptr) return;
+  self->open_power_modal();
 }
 
 void SetupUi::on_settings_time_modal_close(lv_event_t* event) {
@@ -2749,6 +4361,20 @@ void SetupUi::on_settings_time_modal_apply(lv_event_t* event) {
   if (self == nullptr) return;
   if (self->apply_manual_time_modal()) {
     self->close_manual_time_modal();
+  }
+}
+
+void SetupUi::on_power_modal_close(lv_event_t* event) {
+  SetupUi* self = static_cast<SetupUi*>(lv_event_get_user_data(event));
+  if (self == nullptr) return;
+  self->close_power_modal();
+}
+
+void SetupUi::on_power_modal_apply(lv_event_t* event) {
+  SetupUi* self = static_cast<SetupUi*>(lv_event_get_user_data(event));
+  if (self == nullptr) return;
+  if (self->apply_power_modal()) {
+    self->close_power_modal();
   }
 }
 
@@ -2778,33 +4404,183 @@ void SetupUi::on_wifi_modal_forget(lv_event_t* event) {
   self->forget_wifi_credentials();
 }
 
+void SetupUi::on_ble_modal_close(lv_event_t* event) {
+  SetupUi* self = static_cast<SetupUi*>(lv_event_get_user_data(event));
+  if (self == nullptr) return;
+  self->close_ble_modal();
+}
+
+void SetupUi::on_ble_modal_advertise(lv_event_t* event) {
+  SetupUi* self = static_cast<SetupUi*>(lv_event_get_user_data(event));
+  if (self == nullptr) return;
+#if (ENABLE_KEYBOARD_BLE == 1)
+  keyboardBLE_startAdvertisingForAll_HAL();
+  if (self->settings_status_ != nullptr) lv_label_set_text(self->settings_status_, "BLE advertising started");
+#else
+  if (self->settings_status_ != nullptr) {
+    lv_label_set_text(self->settings_status_, "BLE not enabled in this firmware. Build/flash omote-v2-esp32-s3.");
+  }
+#endif
+  self->refresh_ble_modal_status();
+}
+
+void SetupUi::on_ble_modal_stop(lv_event_t* event) {
+  SetupUi* self = static_cast<SetupUi*>(lv_event_get_user_data(event));
+  if (self == nullptr) return;
+#if (ENABLE_KEYBOARD_BLE == 1)
+  keyboardBLE_stopAdvertising_HAL();
+  if (self->settings_status_ != nullptr) lv_label_set_text(self->settings_status_, "BLE advertising stopped");
+#else
+  if (self->settings_status_ != nullptr) {
+    lv_label_set_text(self->settings_status_, "BLE not enabled in this firmware. Build/flash omote-v2-esp32-s3.");
+  }
+#endif
+  self->refresh_ble_modal_status();
+}
+
+void SetupUi::on_ble_modal_disconnect(lv_event_t* event) {
+  SetupUi* self = static_cast<SetupUi*>(lv_event_get_user_data(event));
+  if (self == nullptr) return;
+#if (ENABLE_KEYBOARD_BLE == 1)
+  keyboardBLE_disconnectAllClients_HAL();
+  if (self->settings_status_ != nullptr) lv_label_set_text(self->settings_status_, "BLE clients disconnected");
+#else
+  if (self->settings_status_ != nullptr) {
+    lv_label_set_text(self->settings_status_, "BLE not enabled in this firmware. Build/flash omote-v2-esp32-s3.");
+  }
+#endif
+  self->refresh_ble_modal_status();
+}
+
+void SetupUi::on_ble_modal_list_bonds(lv_event_t* event) {
+  SetupUi* self = static_cast<SetupUi*>(lv_event_get_user_data(event));
+  if (self == nullptr) return;
+#if (ENABLE_KEYBOARD_BLE == 1)
+  const std::string bonds = keyboardBLE_getBonds_HAL();
+  if (self->ble_modal_status_ != nullptr) {
+    if (bonds.empty()) {
+      lv_label_set_text(self->ble_modal_status_, "Bonds: none");
+    } else {
+      lv_label_set_text_fmt(self->ble_modal_status_, "Bonds: %s", bonds.c_str());
+    }
+  }
+  if (self->settings_status_ != nullptr) {
+    if (bonds.empty()) {
+      lv_label_set_text(self->settings_status_, "BLE bonds: none");
+    } else {
+      lv_label_set_text_fmt(self->settings_status_, "BLE bonds: %s", bonds.c_str());
+    }
+  }
+#else
+  if (self->settings_status_ != nullptr) {
+    lv_label_set_text(self->settings_status_, "BLE not enabled in this firmware. Build/flash omote-v2-esp32-s3.");
+  }
+#endif
+}
+
+void SetupUi::on_ble_modal_clear_bonds(lv_event_t* event) {
+  SetupUi* self = static_cast<SetupUi*>(lv_event_get_user_data(event));
+  if (self == nullptr) return;
+#if (ENABLE_KEYBOARD_BLE == 1)
+  keyboardBLE_deleteBonds_HAL();
+  keyboardBLE_disconnectAllClients_HAL();
+  if (self->settings_status_ != nullptr) lv_label_set_text(self->settings_status_, "BLE bonds cleared");
+#else
+  if (self->settings_status_ != nullptr) {
+    lv_label_set_text(self->settings_status_, "BLE not enabled in this firmware. Build/flash omote-v2-esp32-s3.");
+  }
+#endif
+  self->refresh_ble_modal_status();
+}
+
+void SetupUi::on_mqtt_modal_close(lv_event_t* event) {
+  SetupUi* self = static_cast<SetupUi*>(lv_event_get_user_data(event));
+  if (self == nullptr) return;
+  self->close_mqtt_modal();
+}
+
+void SetupUi::on_mqtt_modal_save(lv_event_t* event) {
+  SetupUi* self = static_cast<SetupUi*>(lv_event_get_user_data(event));
+  if (self == nullptr) return;
+  self->apply_mqtt_modal();
+}
+
+void SetupUi::on_mqtt_modal_clear(lv_event_t* event) {
+  SetupUi* self = static_cast<SetupUi*>(lv_event_get_user_data(event));
+  if (self == nullptr) return;
+  self->clear_mqtt_modal();
+}
+
 void SetupUi::on_remote_activity_changed(lv_event_t* event) {
   SetupUi* self = static_cast<SetupUi*>(lv_event_get_user_data(event));
   if (self == nullptr) return;
-  const std::vector<ActivityRecord>& activities = self->activity_registry_.all();
   uint16_t selected = lv_dropdown_get_selected(self->remote_activity_dd_);
-  if (selected < activities.size()) {
-    self->selected_activity_index_ = static_cast<int>(selected);
+  if (selected < self->remote_device_ids_.size()) {
+    const uint32_t selected_device_id = self->remote_device_ids_[selected];
+    self->selected_device_index_ = -1;
+    const std::vector<DeviceRecord>& devices = self->device_registry_.all();
+    for (size_t i = 0; i < devices.size(); ++i) {
+      if (devices[i].id == selected_device_id) {
+        self->selected_device_index_ = static_cast<int>(i);
+        break;
+      }
+    }
   } else {
-    self->selected_activity_index_ = -1;
+    self->selected_device_index_ = -1;
   }
-  self->rebuild_activity_list();
+  self->remote_command_page_index_ = 0;
+  self->rebuild_device_list();
+  self->rebuild_remote_command_buttons();
+  self->save_ui_context();
+}
 
-  const ActivityRecord* activity = self->selected_activity();
-  if (activity == nullptr) {
-    lv_label_set_text(self->remote_status_, "Activity changed");
-    return;
+void SetupUi::on_remote_page_prev(lv_event_t* event) {
+  SetupUi* self = static_cast<SetupUi*>(lv_event_get_user_data(event));
+  if (self == nullptr) return;
+  if (self->remote_command_page_index_ > 0) {
+    --self->remote_command_page_index_;
+    self->rebuild_remote_command_buttons();
   }
-  self->execute_activity_startup_actions(*activity);
-  lv_label_set_text_fmt(self->remote_status_, "Activity: %s", activity->name.c_str());
+}
+
+void SetupUi::on_remote_page_next(lv_event_t* event) {
+  SetupUi* self = static_cast<SetupUi*>(lv_event_get_user_data(event));
+  if (self == nullptr) return;
+  ++self->remote_command_page_index_;
+  self->rebuild_remote_command_buttons();
 }
 
 void SetupUi::on_remote_command_clicked(lv_event_t* event) {
   SetupUi* self = static_cast<SetupUi*>(lv_event_get_user_data(event));
   if (self == nullptr) return;
   lv_obj_t* target = lv_event_get_target(event);
-  CommandSlot slot = static_cast<CommandSlot>(reinterpret_cast<intptr_t>(lv_obj_get_user_data(target)));
-  self->dispatch_remote_command(slot);
+  if (self->remote_activity_dd_ == nullptr || self->remote_device_ids_.empty()) return;
+  const uint16_t selected = lv_dropdown_get_selected(self->remote_activity_dd_);
+  if (selected >= self->remote_device_ids_.size()) {
+    if (self->remote_status_ != nullptr) lv_label_set_text(self->remote_status_, "No device selected");
+    return;
+  }
+  int command_index = -1;
+  for (size_t i = 0; i < self->remote_command_buttons_.size(); ++i) {
+    if (self->remote_command_buttons_[i] == target) {
+      command_index = static_cast<int>(i);
+      break;
+    }
+  }
+  if (command_index < 0 || command_index >= static_cast<int>(self->remote_command_names_.size())) return;
+
+  const uint32_t device_id = self->remote_device_ids_[selected];
+  const std::string& command_name = self->remote_command_names_[command_index];
+  const bool sent = self->dispatcher_.dispatch_device_command(device_id, command_name);
+  const DeviceRecord* device = self->device_registry_.get_by_id(device_id);
+  if (sent) {
+    lv_label_set_text_fmt(self->remote_status_, "Sent: %s (%s)", command_name.c_str(),
+                          device != nullptr ? device->name.c_str() : "Unknown");
+  } else {
+    lv_label_set_text_fmt(self->remote_status_, "Failed: %s (%s): %s", command_name.c_str(),
+                          device != nullptr ? device->name.c_str() : "Unknown",
+                          self->dispatcher_.last_status().c_str());
+  }
 }
 
 void SetupUi::on_keyboard_apply(lv_event_t* event) {

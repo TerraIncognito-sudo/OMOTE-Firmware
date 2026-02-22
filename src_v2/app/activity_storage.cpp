@@ -175,7 +175,9 @@ bool ActivityStorage::save(const std::vector<ActivityRecord>& records) {
   }
   for (size_t i = records.size(); i < kMaxActivities; ++i) {
     std::string key = make_act_key(i);
-    prefs.remove(key.c_str());
+    if (prefs.isKey(key.c_str())) {
+      prefs.remove(key.c_str());
+    }
   }
 
   prefs.end();

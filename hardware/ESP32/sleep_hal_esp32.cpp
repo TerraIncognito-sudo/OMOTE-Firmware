@@ -23,8 +23,18 @@
   const uint8_t ACC_INT_GPIO = 13;
 #endif
 
-int DEFAULT_MOTION_THRESHOLD = 80; // motion above threshold keeps device awake
+int DEFAULT_MOTION_THRESHOLD = 140; // motion above threshold keeps device awake
 int DEFAULT_SLEEP_TIMEOUT = 20000; // default time until device enters sleep mode in milliseconds. Can be overridden.
+
+namespace {
+// Raise the floor so older stored settings don't keep IMU wake overly sensitive.
+constexpr uint8_t kMinMotionThreshold = 120;
+// LIS3DH wake threshold/duration while sleeping.
+// Threshold is in 7-bit steps of full scale (2g here), so 0x58 is intentionally conservative.
+constexpr uint8_t kSleepWakeThresholdReg = 0x58;
+// At 50Hz sample rate, 0x03 requires ~60 ms of sustained motion.
+constexpr uint8_t kSleepWakeDurationReg = 0x03;
+}
 
 // is "lift to wake" enabled
 bool wakeupByIMUEnabled = true;
@@ -94,14 +104,14 @@ void configIMUInterruptsBeforeGoingToSleep()
   //LIS3DH_INT1_THS   
   dataToWrite = 0;
   //Provide 7 bit value, 0x7F always equals max range by accelRange setting
-  dataToWrite |= 0x45;
+  dataToWrite |= kSleepWakeThresholdReg;
   IMU.writeRegister(LIS3DH_INT1_THS, dataToWrite);
   
   //LIS3DH_INT1_DURATION  
   dataToWrite = 0;
   //minimum duration of the interrupt
   //LSB equals 1/(sample rate)
-  dataToWrite |= 0x00; // 1 * 1/50 s = 20ms
+  dataToWrite |= kSleepWakeDurationReg;
   IMU.writeRegister(LIS3DH_INT1_DURATION, dataToWrite);
   
   //LIS3DH_CTRL_REG5
@@ -227,6 +237,9 @@ void init_sleep_HAL() {
   if (motionThreshold == 0){
     motionThreshold = DEFAULT_MOTION_THRESHOLD;
   }
+  if (motionThreshold < kMinMotionThreshold) {
+    motionThreshold = kMinMotionThreshold;
+  }
 
   // Find out wakeup cause
   if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT1) {
@@ -303,5 +316,8 @@ void set_motionThreshold_HAL(uint8_t aMotionThreshold) {
   motionThreshold = aMotionThreshold;
   if (motionThreshold == 0) {
     motionThreshold = DEFAULT_MOTION_THRESHOLD;
+  }
+  if (motionThreshold < kMinMotionThreshold) {
+    motionThreshold = kMinMotionThreshold;
   }
 }

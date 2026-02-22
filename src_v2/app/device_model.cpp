@@ -20,7 +20,34 @@ const std::vector<CommandSlot> kAllCommandSlots = {
 };
 
 const std::vector<std::string> kCommonCommandNames = {
-    "Power", "Volume Up", "Volume Down", "Mute", "Up", "Down", "Left", "Right", "OK", "Back", "Home",
+    "Power",
+    "Power On",
+    "Power Off",
+    "Volume Up",
+    "Volume Down",
+    "Mute",
+    "Up",
+    "Down",
+    "Left",
+    "Right",
+    "OK",
+    "Back",
+    "Home",
+    "Input",
+    "Menu",
+    "Guide",
+    "Channel Up",
+    "Channel Down",
+    "Play",
+    "Pause",
+    "Play/Pause",
+    "Stop",
+    "Rewind",
+    "Fast Forward",
+    "Next",
+    "Previous",
+    "Record",
+    "Info",
 };
 }  // namespace
 

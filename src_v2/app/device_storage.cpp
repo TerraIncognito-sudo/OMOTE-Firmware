@@ -175,7 +175,9 @@ bool DeviceStorage::save(const std::vector<DeviceRecord>& records) {
   }
   for (size_t i = records.size(); i < kMaxDevices; ++i) {
     std::string key = make_dev_key(i);
-    prefs.remove(key.c_str());
+    if (prefs.isKey(key.c_str())) {
+      prefs.remove(key.c_str());
+    }
   }
 
   prefs.end();

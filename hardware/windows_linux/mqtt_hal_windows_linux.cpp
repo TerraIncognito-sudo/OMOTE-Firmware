@@ -40,6 +40,11 @@ uint8_t recvmem1[4096];
 struct mqtt_client mqttClient;
 std::string uniqueClientSuffix = "";
 int state = 0;
+std::string mqttHost = MQTT_SERVER;
+uint16_t mqttPort = static_cast<uint16_t>(MQTT_SERVER_PORT);
+std::string mqttUser = MQTT_USER;
+std::string mqttPass = MQTT_PASS;
+std::string mqttClientName = MQTT_CLIENTNAME;
 
 tAnnounceWiFiconnected_cb thisAnnounceWiFiconnected_cb = NULL;
 void set_announceWiFiconnected_cb_HAL(tAnnounceWiFiconnected_cb pAnnounceWiFiconnected_cb) {
@@ -109,9 +114,10 @@ void reconnect_mqtt(struct mqtt_client *mqttClient, void**) {
 
   mqtt_reinit(mqttClient, sockfd, sendmem1, sizeof(sendmem1), recvmem1, sizeof(recvmem1));
 
-  std::string mqttClientName = std::string(MQTT_CLIENTNAME) + uniqueClientSuffix;
+  std::string clientName = mqttClientName.empty() ? std::string("OMOTE") : mqttClientName;
+  std::string resolvedClientName = clientName + uniqueClientSuffix;
   //                       client_id,              will_topic, will_message, will_message_size, user_name, password,  connect_flags, keep_alive
-  mqtt_connect(mqttClient, mqttClientName.c_str(), NULL,       NULL,         0,                 MQTT_USER, MQTT_PASS, 0,             30);
+  mqtt_connect(mqttClient, resolvedClientName.c_str(), NULL,       NULL,         0,                 mqttUser.c_str(), mqttPass.c_str(), 0,             30);
   if (mqttClient->error != MQTT_OK) {
     printf("MQTT: connect error: %s\r\n", mqtt_error_str(mqttClient->error));
     // sockfd = -1;
@@ -153,7 +159,11 @@ void init_mqtt_HAL(void) {
   #endif
 
   char MACaddress[6*3];
-  sockfd = open_nb_socket(MQTT_SERVER, std::to_string(MQTT_SERVER_PORT).c_str(), MACaddress);
+  if (!mqtt_is_configured_HAL()) {
+    printf("MQTT: broker not configured\r\n");
+    return;
+  }
+  sockfd = open_nb_socket(mqttHost.c_str(), std::to_string(mqttPort).c_str(), MACaddress);
   if (sockfd == -1) {
     printf("MQTT: Failed to open socket\r\n");
     return;
@@ -210,6 +220,49 @@ bool publishMQTTMessage_HAL(const char *topic, const char *payload) {
 
   return true;
 }
+
+bool mqtt_is_configured_HAL() {
+  return !mqttHost.empty() && mqttPort > 0;
+}
+
+bool mqtt_is_connected_HAL() {
+  return sockfd != -1;
+}
+
+bool mqtt_get_broker_config_HAL(std::string* out_host, uint16_t* out_port, std::string* out_user,
+                                std::string* out_pass, std::string* out_client_name) {
+  if (out_host == NULL || out_port == NULL || out_user == NULL || out_pass == NULL || out_client_name == NULL) {
+    return false;
+  }
+  *out_host = mqttHost;
+  *out_port = mqttPort;
+  *out_user = mqttUser;
+  *out_pass = mqttPass;
+  *out_client_name = mqttClientName;
+  return true;
+}
+
+bool mqtt_set_broker_config_HAL(const std::string& host, uint16_t port, const std::string& user,
+                                const std::string& pass, const std::string& client_name) {
+  if (host.empty() || port == 0) return false;
+  mqttHost = host;
+  mqttPort = port;
+  mqttUser = user;
+  mqttPass = pass;
+  mqttClientName = client_name.empty() ? "OMOTE" : client_name;
+  return true;
+}
+
+bool mqtt_clear_broker_config_HAL() {
+  mqttHost.clear();
+  mqttPort = 0;
+  mqttUser.clear();
+  mqttPass.clear();
+  mqttClientName = "OMOTE";
+  return true;
+}
+
+void wifi_request_time_sync_HAL() {}
 
 void wifi_shutdown_HAL() {
   /* disconnect */

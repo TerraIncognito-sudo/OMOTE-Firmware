@@ -1,6 +1,9 @@
 #include <sstream>
 #include <algorithm>
 #include <vector>
+#include <Arduino.h>
+#include <cstring>
+#include <time.h>
 #include "WiFi.h"
 #include <PubSubClient.h>
 #include <Preferences.h>
@@ -14,12 +17,42 @@
 WiFiClient espClient;
 PubSubClient mqttClient(espClient);
 bool isWifiConnected = false;
+bool wifiShutdownRequested = false;
 bool wifiCredentialsLoaded = false;
 std::string savedWifiSsid = "";
 std::string savedWifiPassword = "";
+bool mqttConfigLoaded = false;
+std::string savedMqttHost = "";
+uint16_t savedMqttPort = 0;
+std::string savedMqttUser = "";
+std::string savedMqttPass = "";
+std::string savedMqttClientName = "";
 constexpr const char* kWifiPrefsNs = "omotev2wifi";
 constexpr const char* kWifiSsidKey = "ssid";
 constexpr const char* kWifiPasswordKey = "password";
+constexpr const char* kMqttPrefsNs = "omotev2mqtt";
+constexpr const char* kMqttHostKey = "host";
+constexpr const char* kMqttPortKey = "port";
+constexpr const char* kMqttUserKey = "user";
+constexpr const char* kMqttPassKey = "pass";
+constexpr const char* kMqttClientKey = "client";
+constexpr const char* kDefaultPlaceholderMqttServer = "IPAddressOfYourBroker";
+constexpr const char* kNtpServer1 = "pool.ntp.org";
+constexpr const char* kNtpServer2 = "time.nist.gov";
+constexpr const char* kNtpServer3 = "time.google.com";
+constexpr unsigned long kWifiReconnectThrottleMs = 3000;
+constexpr unsigned long kMqttReconnectBaseIntervalMs = 5000;
+constexpr unsigned long kMqttReconnectMaxIntervalMs = 60000;
+constexpr unsigned long kMqttFailureLogIntervalMs = 10000;
+constexpr unsigned long kMqttConfigLogIntervalMs = 60000;
+constexpr unsigned long kTimeSyncLogIntervalMs = 30000;
+unsigned long lastWifiReconnectAttemptMs = 0;
+unsigned long mqttReconnectIntervalMs = kMqttReconnectBaseIntervalMs;
+unsigned long lastReconnectAttempt = 0;
+unsigned long lastMqttFailureLogMs = 0;
+unsigned long lastMqttConfigLogMs = 0;
+unsigned long lastTimeSyncRequestMs = 0;
+unsigned long lastTimeSyncLogMs = 0;
 
 tAnnounceWiFiconnected_cb thisAnnounceWiFiconnected_cb = NULL;
 void set_announceWiFiconnected_cb_HAL(tAnnounceWiFiconnected_cb pAnnounceWiFiconnected_cb) {
@@ -45,6 +78,128 @@ static void announce_subscribed_topic(const std::string& topic, const std::strin
 
 static bool is_default_placeholder_ssid(const std::string& ssid) {
   return ssid == "YourWifiSSID";
+}
+
+static std::string trim_copy(const std::string& in) {
+  size_t start = 0;
+  while (start < in.size() && (in[start] == ' ' || in[start] == '\t')) ++start;
+  size_t end = in.size();
+  while (end > start && (in[end - 1] == ' ' || in[end - 1] == '\t')) --end;
+  return in.substr(start, end - start);
+}
+
+static bool is_default_placeholder_mqtt_server(const std::string& server) {
+  return server.empty() || server == kDefaultPlaceholderMqttServer;
+}
+
+static void load_mqtt_config_once() {
+  if (mqttConfigLoaded) return;
+  Preferences prefs;
+  if (prefs.begin(kMqttPrefsNs, true)) {
+    savedMqttHost = std::string(prefs.getString(kMqttHostKey, "").c_str());
+    savedMqttPort = static_cast<uint16_t>(prefs.getUInt(kMqttPortKey, 0));
+    savedMqttUser = std::string(prefs.getString(kMqttUserKey, "").c_str());
+    savedMqttPass = std::string(prefs.getString(kMqttPassKey, "").c_str());
+    savedMqttClientName = std::string(prefs.getString(kMqttClientKey, "").c_str());
+    prefs.end();
+  }
+  mqttConfigLoaded = true;
+}
+
+static bool save_mqtt_config_internal(const std::string& host, uint16_t port, const std::string& user,
+                                      const std::string& pass, const std::string& client_name) {
+  Preferences prefs;
+  if (!prefs.begin(kMqttPrefsNs, false)) return false;
+  prefs.putString(kMqttHostKey, host.c_str());
+  prefs.putUInt(kMqttPortKey, static_cast<uint32_t>(port));
+  prefs.putString(kMqttUserKey, user.c_str());
+  prefs.putString(kMqttPassKey, pass.c_str());
+  prefs.putString(kMqttClientKey, client_name.c_str());
+  prefs.end();
+  savedMqttHost = host;
+  savedMqttPort = port;
+  savedMqttUser = user;
+  savedMqttPass = pass;
+  savedMqttClientName = client_name;
+  mqttConfigLoaded = true;
+  return true;
+}
+
+static bool clear_mqtt_config_internal() {
+  Preferences prefs;
+  if (!prefs.begin(kMqttPrefsNs, false)) return false;
+  prefs.remove(kMqttHostKey);
+  prefs.remove(kMqttPortKey);
+  prefs.remove(kMqttUserKey);
+  prefs.remove(kMqttPassKey);
+  prefs.remove(kMqttClientKey);
+  prefs.end();
+  savedMqttHost.clear();
+  savedMqttPort = 0;
+  savedMqttUser.clear();
+  savedMqttPass.clear();
+  savedMqttClientName.clear();
+  mqttConfigLoaded = true;
+  return true;
+}
+
+static void get_effective_mqtt_config(std::string* out_host, uint16_t* out_port, std::string* out_user,
+                                      std::string* out_pass, std::string* out_client_name) {
+  load_mqtt_config_once();
+  if (out_host != nullptr) {
+    *out_host = !savedMqttHost.empty() ? savedMqttHost : std::string(MQTT_SERVER);
+  }
+  if (out_port != nullptr) {
+    if (savedMqttPort > 0) {
+      *out_port = savedMqttPort;
+    } else {
+      *out_port = static_cast<uint16_t>(MQTT_SERVER_PORT);
+    }
+  }
+  if (out_user != nullptr) {
+    *out_user = !savedMqttUser.empty() ? savedMqttUser : std::string(MQTT_USER);
+  }
+  if (out_pass != nullptr) {
+    *out_pass = !savedMqttPass.empty() ? savedMqttPass : std::string(MQTT_PASS);
+  }
+  if (out_client_name != nullptr) {
+    *out_client_name = !savedMqttClientName.empty() ? savedMqttClientName : std::string(MQTT_CLIENTNAME);
+    if (out_client_name->empty()) {
+      *out_client_name = "OMOTE";
+    }
+  }
+}
+
+static bool has_valid_mqtt_config() {
+  std::string host;
+  uint16_t port = 0;
+  get_effective_mqtt_config(&host, &port, nullptr, nullptr, nullptr);
+  return !is_default_placeholder_mqtt_server(host) && (port > 0);
+}
+
+static void request_time_sync_internal(const char* reason) {
+  const unsigned long now = millis();
+  if (now - lastTimeSyncRequestMs < 2000) return;
+  lastTimeSyncRequestMs = now;
+
+  const char* tz = getenv("TZ");
+  if (tz == nullptr || strlen(tz) == 0) {
+    tz = "UTC0";
+  }
+  configTzTime(tz, kNtpServer1, kNtpServer2, kNtpServer3);
+
+  bool should_log = (reason != nullptr && reason[0] != '\0');
+  if (!should_log && (now - lastTimeSyncLogMs >= kTimeSyncLogIntervalMs)) {
+    should_log = true;
+  }
+  if (should_log) {
+    if (reason != nullptr && reason[0] != '\0') {
+      Serial.printf("NTP sync requested (%s)\r\n", reason);
+    } else {
+      Serial.printf("NTP sync requested\r\n");
+    }
+    lastTimeSyncLogMs = now;
+  }
 }
 
 static void load_wifi_credentials_once() {
@@ -107,12 +262,58 @@ static bool start_wifi_with_effective_credentials() {
   }
 
   WiFi.mode(WIFI_STA);
+  wifiShutdownRequested = false;
+  lastWifiReconnectAttemptMs = millis();
   WiFi.begin(ssid.c_str(), password.c_str());
   return true;
 }
 
 bool getIsWifiConnected_HAL() {
   return isWifiConnected;
+}
+
+bool mqtt_is_configured_HAL() {
+  return has_valid_mqtt_config();
+}
+
+bool mqtt_is_connected_HAL() {
+  return mqttClient.connected();
+}
+
+bool mqtt_get_broker_config_HAL(std::string* out_host, uint16_t* out_port, std::string* out_user,
+                                std::string* out_pass, std::string* out_client_name) {
+  if (out_host == NULL || out_port == NULL || out_user == NULL || out_pass == NULL || out_client_name == NULL) {
+    return false;
+  }
+  get_effective_mqtt_config(out_host, out_port, out_user, out_pass, out_client_name);
+  return true;
+}
+
+bool mqtt_set_broker_config_HAL(const std::string& host, uint16_t port, const std::string& user,
+                                const std::string& pass, const std::string& client_name) {
+  const std::string normalized_host = host;
+  if (trim_copy(normalized_host).empty() || port == 0) return false;
+  if (!save_mqtt_config_internal(trim_copy(normalized_host), port, user, pass, trim_copy(client_name))) return false;
+  if (mqttClient.connected()) {
+    mqttClient.disconnect();
+  }
+  mqttReconnectIntervalMs = kMqttReconnectBaseIntervalMs;
+  lastReconnectAttempt = 0;
+  return true;
+}
+
+bool mqtt_clear_broker_config_HAL() {
+  if (!clear_mqtt_config_internal()) return false;
+  if (mqttClient.connected()) {
+    mqttClient.disconnect();
+  }
+  mqttReconnectIntervalMs = kMqttReconnectBaseIntervalMs;
+  lastReconnectAttempt = 0;
+  return true;
+}
+
+void wifi_request_time_sync_HAL() {
+  request_time_sync_internal("manual");
 }
 
 // WiFi status event
@@ -128,15 +329,25 @@ void WiFiEvent(WiFiEvent_t event){
   // Set status bar icon based on WiFi status
   if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP || event == ARDUINO_EVENT_WIFI_STA_GOT_IP6) {
     isWifiConnected = true;
+    wifiShutdownRequested = false;
+    mqttReconnectIntervalMs = kMqttReconnectBaseIntervalMs;
     announce_wifi_connected(true);
     Serial.printf("WiFi connected, IP address: %s\r\n", WiFi.localIP().toString().c_str());
+    request_time_sync_internal("wifi connected");
 
   } else if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
     isWifiConnected = false;
     announce_wifi_connected(false);
-    // automatically try to reconnect
-    Serial.printf("WiFi got disconnected. Will try to reconnect.\r\n");
-    start_wifi_with_effective_credentials();
+    if (wifiShutdownRequested || WiFi.getMode() == WIFI_OFF) {
+      // Intentional disconnect during sleep/power down.
+      return;
+    }
+    // automatically try to reconnect, throttled
+    const unsigned long now = millis();
+    if (now - lastWifiReconnectAttemptMs >= kWifiReconnectThrottleMs) {
+      Serial.printf("WiFi disconnected. Reconnecting...\r\n");
+      start_wifi_with_effective_credentials();
+    }
 
   } else {
     // e.g. ARDUINO_EVENT_WIFI_STA_CONNECTED or many others
@@ -151,8 +362,14 @@ void init_mqtt_HAL(void) {
   // Setup WiFi
   WiFi.setHostname("OMOTE"); //define hostname
   WiFi.onEvent(WiFiEvent);
+  wifiShutdownRequested = false;
+  mqttReconnectIntervalMs = kMqttReconnectBaseIntervalMs;
+  lastReconnectAttempt = 0;
+  lastMqttFailureLogMs = 0;
+  lastMqttConfigLogMs = 0;
   start_wifi_with_effective_credentials();
   WiFi.setSleep(true);
+  request_time_sync_internal("boot");
 }
 
 std::string subscribeTopicOMOTEtest = "OMOTE/test";
@@ -237,42 +454,62 @@ void mqtt_subscribeTopics() {
 }
 
 bool checkMQTTconnection() {
-
-  if (WiFi.isConnected()) {
-    if (mqttClient.connected()) {
-      return true;
-    } else {
-      // try to connect to mqtt server
-      mqttClient.setBufferSize(512);   // default is 256
-      //mqttClient.setKeepAlive(15);     // default is 15   Client will send MQTTPINGREQ to keep connection alive
-      //mqttClient.setSocketTimeout(15); // default is 15   This determines how long the client will wait for incoming data when it expects data to arrive - for example, whilst it is in the middle of reading an MQTT packet.
-      mqttClient.setServer(MQTT_SERVER, MQTT_SERVER_PORT); // MQTT initialization
-      
-      std::string mqttClientName = std::string(MQTT_CLIENTNAME) + "_esp32_" + std::string(WiFi.macAddress().c_str());
-      if (mqttClient.connect(mqttClientName.c_str(), MQTT_USER, MQTT_PASS)) {
-        Serial.printf("  Successfully connected to MQTT broker\r\n");
-    
-        mqtt_subscribeTopics();
-
-      } else {
-        Serial.printf("  MQTT connection failed (but WiFi is available). Will try later ...\r\n");
-
-      }
-      return mqttClient.connected();
-    }
-  } else {
-    // Serial.printf("  No connection to MQTT server, because WiFi ist not connected.\r\n");
+  if (WiFi.getMode() == WIFI_OFF || wifiShutdownRequested) {
     return false;
-  }  
-}
+  }
+  if (!WiFi.isConnected()) {
+    return false;
+  }
+  if (!has_valid_mqtt_config()) {
+    const unsigned long now = millis();
+    if (now - lastMqttConfigLogMs >= kMqttConfigLogIntervalMs) {
+      lastMqttConfigLogMs = now;
+      Serial.printf("MQTT disabled: configure MQTT_SERVER in secrets_override.h\r\n");
+    }
+    return false;
+  }
+  if (mqttClient.connected()) {
+    return true;
+  }
 
-unsigned long reconnectInterval = 100;
-// in order to do reconnect immediately ...
-unsigned long lastReconnectAttempt = millis() - reconnectInterval - 1;
+  std::string mqtt_host;
+  uint16_t mqtt_port = 0;
+  std::string mqtt_user;
+  std::string mqtt_pass;
+  std::string mqtt_client_name;
+  get_effective_mqtt_config(&mqtt_host, &mqtt_port, &mqtt_user, &mqtt_pass, &mqtt_client_name);
+
+  // try to connect to mqtt server
+  mqttClient.setBufferSize(512);   // default is 256
+  mqttClient.setServer(mqtt_host.c_str(), mqtt_port); // MQTT initialization
+
+  std::string mqttClientName = mqtt_client_name + "_esp32_" + std::string(WiFi.macAddress().c_str());
+  if (mqttClient.connect(mqttClientName.c_str(), mqtt_user.c_str(), mqtt_pass.c_str())) {
+    Serial.printf("  Successfully connected to MQTT broker\r\n");
+    mqtt_subscribeTopics();
+    mqttReconnectIntervalMs = kMqttReconnectBaseIntervalMs;
+    return true;
+  }
+
+  // Exponential backoff (capped) and throttled logging to prevent error spam.
+  mqttReconnectIntervalMs = std::min(mqttReconnectIntervalMs * 2, kMqttReconnectMaxIntervalMs);
+  const unsigned long now = millis();
+  if (now - lastMqttFailureLogMs >= kMqttFailureLogIntervalMs) {
+    lastMqttFailureLogMs = now;
+    Serial.printf("  MQTT connect failed. Retrying in %lu ms...\r\n", mqttReconnectIntervalMs);
+  }
+  return false;
+}
 void mqtt_loop_HAL() {
+  if (wifiShutdownRequested || WiFi.getMode() == WIFI_OFF || !WiFi.isConnected()) {
+    return;
+  }
+  if (!has_valid_mqtt_config()) {
+    return;
+  }
   if (!mqttClient.connected()) {
     unsigned long currentMillis = millis();
-    if ((currentMillis - lastReconnectAttempt) > reconnectInterval) {
+    if ((currentMillis - lastReconnectAttempt) > mqttReconnectIntervalMs) {
       lastReconnectAttempt = currentMillis;
       // Attempt to reconnect
       checkMQTTconnection();
@@ -285,24 +522,41 @@ void mqtt_loop_HAL() {
 }
 
 bool publishMQTTMessage_HAL(const char *topic, const char *payload){
-
+  if (wifiShutdownRequested || WiFi.getMode() == WIFI_OFF) {
+    Serial.printf("MQTT publish skipped: WiFi is off\r\n");
+    return false;
+  }
+  if (!has_valid_mqtt_config()) {
+    Serial.printf("MQTT publish skipped: broker not configured\r\n");
+    return false;
+  }
+  const char* safe_topic = (topic != nullptr) ? topic : "";
+  const char* safe_payload = (payload != nullptr) ? payload : "";
   if (checkMQTTconnection()) {
-    // Serial.printf("Sending mqtt payload to topic \"%s\": %s\r\n", topic, payload);
+    Serial.printf("MQTT publish attempt: topic=\"%s\" payload=\"%s\"\r\n", safe_topic, safe_payload);
       
-    if (mqttClient.publish(topic, payload)) {
-      // Serial.printf("Publish ok\r\n");
+    if (mqttClient.publish(safe_topic, safe_payload)) {
+      Serial.printf("MQTT publish ok: %s\r\n", safe_topic);
       return true;
     }
     else {
-      Serial.printf("Publish failed\r\n");
+      const unsigned long now = millis();
+      if (now - lastMqttFailureLogMs >= kMqttFailureLogIntervalMs) {
+        lastMqttFailureLogMs = now;
+        Serial.printf("MQTT publish failed: %s\r\n", safe_topic);
+      }
     }
-  } else {
-    Serial.printf("  Cannot publish mqtt message, because checkMQTTconnection failed (WiFi or mqtt is not connected)\r\n");
   }
   return false;
 }
 
 void wifi_shutdown_HAL() {
+  wifiShutdownRequested = true;
+  isWifiConnected = false;
+  announce_wifi_connected(false);
+  if (mqttClient.connected()) {
+    mqttClient.disconnect();
+  }
   WiFi.disconnect();
   WiFi.mode(WIFI_OFF);
 }
@@ -334,6 +588,7 @@ bool wifi_set_credentials_HAL(const std::string& ssid, const std::string& passwo
     return false;
   }
 
+  wifiShutdownRequested = false;
   WiFi.disconnect();
   delay(50);
   return start_wifi_with_effective_credentials();
@@ -348,11 +603,13 @@ bool wifi_get_saved_credentials_HAL(std::string* out_ssid, std::string* out_pass
 }
 
 bool wifi_clear_saved_credentials_HAL() {
+  wifiShutdownRequested = false;
   WiFi.disconnect();
   return clear_wifi_credentials_internal();
 }
 
 bool wifi_connect_saved_HAL() {
+  wifiShutdownRequested = false;
   return start_wifi_with_effective_credentials();
 }
 

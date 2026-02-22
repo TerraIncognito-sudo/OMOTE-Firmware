@@ -25,37 +25,54 @@ The end state is:
 - Touch UI pages:
 - `Devices`: add/remove/rename devices, edit named commands, add/remove command names
 - `Activities`: add/remove/rename activities, map physical keys, define startup steps
-- `Remote`: choose activity and trigger mapped commands
-- `Settings`: timestamped SD backup, selectable SD restore, WiFi settings (scan/select/password/connect), manual time + timezone set
+- `Remote`: choose device and trigger generated command buttons from mapped named commands
+- `Settings`: timestamped SD backup, selectable SD restore, WiFi settings (scan/select/password/connect), BLE settings (advertise/stop/disconnect/bonds), MQTT broker settings (host/port/auth/client), manual time + timezone set, power settings (sleep timeout + command debounce + lift-to-wake)
 - Backup behavior:
 - each backup is saved as its own timestamped file
 - restore flow opens a backup picker so you can choose which backup to restore
 - Activity switching behavior:
-- selected activity is shared between `Activities` and `Remote`
+- activity selection is managed from `Activities`
 - startup actions execute on activity change
 - Keymapping behavior:
 - key list includes 24 physical keys
 - each key shows mapping state (`(*)` or `(none)`)
 - mapping targets a specific `device + named command`
+- activity `Edit` keymap shows all devices from the device registry
+- Remote runtime behavior:
+- command buttons are generated from each device's saved named commands (no hardcoded runtime button list)
+- generated command pages support pagination for larger command sets
+- generated command order prioritizes common command names, then custom commands
 - Status and lifecycle:
 - battery percent/charging indicator in top bar
 - top-bar clock (`HH:MM`) from system time
-- WiFi indicator in top bar (`green` connected, `red` disconnected)
+- WiFi indicator in top bar (`green` connected, `red` disconnected, `amber` when WiFi is up but MQTT is not connected)
 - settings status transitions from `WiFi connecting` to `WiFi connected/disconnected/timeout`
 - manual time setting available when WiFi/NTP is unavailable
-- charge protection loop
+- wake source status message after boot/wake
+- charge protection loop with hold-time hysteresis before cutoff/resume
 - sleep/activity checks active
 - keypad LED update path active
 - WiFi backbone:
 - WiFi/MQTT HAL is enabled in V2 build target
-- NTP sync is requested at boot (when WiFi credentials are valid)
+- NTP sync is requested at boot and on WiFi reconnect
+- MQTT connection attempts are skipped when broker settings are still placeholder/default
+- MQTT dispatch:
+- MQTT transport commands publish from `Remote` and physical key paths
+- command payload format supports `topic|payload` (or topic on line 1, payload on line 2)
+- command editor includes MQTT template import with merge/replace mode
+- publish failures are surfaced in UI status text
+- BLE dispatch:
+- BLE transport commands publish from `Remote` and physical key paths
+- BLE payload format supports `key:<action>`, `media:<action>`, `text:<value>`, with optional `address@...` target
+- BLE pairing/bond controls are available in `Settings`
+- Unified dispatch behavior:
+- standardized dispatch result states (`Sent`, `No mapping`, `Invalid payload`, `Transport unavailable`, `Send failed`, `Debounced`)
+- centralized command debouncing to suppress rapid-repeat accidental sends
 
 ### Current intentional limits
 
-- Runtime transport execution is effectively IR-only in this target today.
 - WiFi is currently single-profile (one saved SSID/password); multi-profile management is not implemented yet.
-- BLE keyboard transport is not enabled in this target yet.
-- Remote page layout is still mostly fixed/static rather than generated from configuration.
+- HTTP runtime dispatch path is not enabled yet in this target.
 
 ## Build and Flash
 
@@ -66,9 +83,9 @@ The end state is:
 3. Basic on-device validation:
    - Add one IR device in `Devices`
    - In `Edit`, add command name + payload
-   - Create activity in `Activities`, include the device
+   - Create activity in `Activities`
    - Map one physical key to that device command
-   - Select activity in `Remote` and test on-screen + physical key behavior
+   - Select device in `Remote` and test on-screen + physical key behavior
 
 ## Definition of "Fully Implemented Product"
 
@@ -151,6 +168,7 @@ Done when:
 ### Phase 3: Sleep, Wake, and Power Lifecycle Hardening
 
 Depends on: Phase 2
+Status: `completed`
 
 Objective:
 - make device power behavior production-safe
@@ -170,6 +188,7 @@ Done when:
 ### Phase 4: WiFi Backbone
 
 Depends on: Phase 2 (and coordinated with Phase 3 for power impact)
+Status: `completed`
 
 Objective:
 - add a reliable network foundation before MQTT features
@@ -190,6 +209,7 @@ Done when:
 ### Phase 5: MQTT Backbone
 
 Depends on: Phase 4
+Status: `in progress`
 
 Objective:
 - enable runtime MQTT command execution on top of working WiFi
@@ -209,6 +229,7 @@ Done when:
 ### Phase 6: BLE Keyboard Backbone
 
 Depends on: Phase 2 (and Phase 3 for power interactions)
+Status: `in progress`
 
 Objective:
 - enable BLE keyboard transport as a first-class runtime command path
@@ -228,6 +249,7 @@ Done when:
 ### Phase 7: Unified Runtime Dispatch Engine
 
 Depends on: Phases 5 and 6
+Status: `completed`
 
 Objective:
 - provide one robust execution pipeline across all transports
@@ -251,6 +273,7 @@ Done when:
 ### Phase 8: On-device Learning and Command Import
 
 Depends on: Phase 7
+Status: `completed`
 
 Objective:
 - let users create commands directly on the remote at scale
@@ -270,6 +293,7 @@ Done when:
 ### Phase 9: Generated Runtime Home-Control UI
 
 Depends on: Phase 8
+Status: `completed`
 
 Objective:
 - replace fixed remote controls with UI generated from configuration
