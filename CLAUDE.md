@@ -24,11 +24,63 @@ pio run -e linux_64bit
 pio run -e windows_64bit
 pio run -e macOS
 
+# Board test targets (hardware diagnostics)
+pio run -e esp32_testboard-Rev1toRev4
+pio run -e esp32-s3_testboard-Rev5andHigher
+
 # Serial monitor
 pio device monitor -b 115200
 ```
 
 There is no test suite or linter configured in this project.
+
+## CI/CD
+
+GitHub Actions workflows in `.github/workflows/` run PlatformIO builds on push/PR:
+- `build-platformio-ubuntu.yml` — Linux build
+- `build-platformio-macos.yml` — macOS build
+- `build-platformio-windows.yml` — Windows build (more complex setup due to MSYS2/SDL2)
+
+All three build the desktop simulator targets. There are no automated test or lint steps.
+
+## Repository Structure
+
+```
+OMOTE-Firmware/
+├── platformio.ini              # All build environments and flags
+├── noota_16MB_custom.csv       # ESP32-S3 partition table (no OTA, 16MB)
+├── CLAUDE.md                   # This file
+├── README.md                   # Project overview with hardware info
+├── hardware/                   # Hardware Abstraction Layer
+│   ├── hardwareLayer.h         # Central HAL interface selector
+│   ├── ESP32/                  # ESP32/ESP32-S3 HAL implementation
+│   │   ├── *_hal_esp32.{h,cpp} # HAL modules (15 pairs)
+│   │   ├── boardtest/          # Hardware diagnostic utility
+│   │   └── lib/                # Bundled: Keypad, ESP32-BLE-Keyboard
+│   └── windows_linux/          # Desktop simulator HAL
+│       ├── *_hal_windows_linux.{h,cpp}
+│       ├── keypad_gui/         # SDL2 keypad UI for simulator
+│       └── lib/                # Bundled: MQTT-C, nlohmann/json
+├── src_v2/                     # V2 active development
+│   ├── main.cpp                # Arduino setup()/loop() entry point
+│   ├── README.md               # Canonical roadmap and capability snapshot
+│   ├── app/                    # Business logic (16 files)
+│   └── ui/                     # LVGL UI (2 files)
+├── src/                        # V1 legacy (90 files, reference only)
+│   ├── devices/                # Hardcoded device definitions
+│   ├── devices_pool/           # Additional device templates
+│   ├── guis/                   # Scene-based GUIs
+│   └── scenes/                 # Pre-configured scene profiles
+└── tools/omote-webapp/         # Companion browser config tool
+    ├── app.py                  # FastAPI server
+    ├── serial_bridge.py        # WebSocket ↔ USB serial bridge
+    ├── requirements.txt        # Python dependencies
+    └── static/                 # Frontend (no build step)
+        ├── index.html          # Alpine.js SPA
+        ├── css/app.css
+        └── js/                 # app.js, serial.js, devices.js,
+                                # activities.js, backup.js, monitor.js
+```
 
 ## Architecture
 
@@ -36,33 +88,43 @@ There is no test suite or linter configured in this project.
 
 Platform-agnostic interfaces with ESP32 and desktop (Windows/Linux) implementations. Each HAL module has a paired `.h`/`.cpp` (e.g., `battery_hal_esp32.h/cpp`). The entry point `hardware/hardwareLayer.h` selects the appropriate platform implementation.
 
-Key HAL modules: battery, infrared sender/receiver, keypad (5x5 matrix), BLE keyboard, TFT display (LovyanGFX), LVGL init, MQTT (PubSubClient), SD card (SdFat), sleep/wake, NVS preferences storage.
+Key HAL modules: battery, infrared sender/receiver, keypad (5x5 matrix), BLE keyboard, TFT display (LovyanGFX), LVGL init, MQTT (PubSubClient on ESP32, MQTT-C on desktop), SD card (SdFat), sleep/wake, NVS preferences storage, user LED.
 
-Bundled libraries live in `hardware/ESP32/lib/` (Keypad scanning, ESP32-BLE-Keyboard).
+Bundled libraries live in `hardware/ESP32/lib/` (Keypad scanning, ESP32-BLE-Keyboard) and `hardware/windows_linux/lib/` (MQTT-C, nlohmann/json).
+
+The desktop simulator includes a keypad GUI (`hardware/windows_linux/keypad_gui/`) for simulating physical button presses via SDL2.
 
 ### V2 Application (`src_v2/`)
 
 **Entry point:** `main.cpp` (Arduino `setup()`/`loop()`)
 
-**App layer** (`src_v2/app/`):
+**App layer** (`src_v2/app/`) — 16 files:
+- **DeviceModel** (`device_model.{h,cpp}`) — data structures for devices, transports, protocols, and named commands.
+- **ActivityModel** (`activity_model.h`) — data structures for activities, key bindings, and startup actions.
 - **DeviceRegistry** / **DeviceStorage** — runtime registry of devices persisted to NVS flash. Each device has a type, transport (IR/BLE/MQTT/HTTP), protocol, and a vector of named commands (name→payload pairs).
 - **ActivityRegistry** / **ActivityStorage** — runtime registry of activities persisted to NVS. Each activity has device references, physical key→(device, command) bindings, and startup action sequences.
 - **CommandDispatcher** — unified dispatch engine across all transports. Returns typed `DispatchResult` (Sent, NotMapped, InvalidPayload, TransportUnavailable, SendFailed, Debounced). Enforces debounce interval (default 140ms).
 - **SdBackupService** — backup/restore to SD in text + JSON formats with schema migration support. Writes a sync hook file (`/omote_v2_sync_hook.json`). Also exposes `serialize_to_text()` / `parse_from_text()` static methods for serial backup export/import without SD.
 - **SerialHandler** — non-blocking serial command handler (`@@`-prefixed JSON protocol). Supports 25 commands: device/activity CRUD, dispatch, SD backup/restore, serial export/import, chunked SD file transfer (base64). Resets sleep timer on serial activity.
 
-**UI layer** (`src_v2/ui/`):
-- **SetupUi** — single large LVGL controller managing 4 tabs (Devices, Activities, Remote, Settings) plus modal flows for editing. Screen is 240x320. Uses LVGL v8.3.
+**UI layer** (`src_v2/ui/`) — 2 files:
+- **SetupUi** (`setup_ui.{h,cpp}`) — single large LVGL controller (~184KB source) managing 4 tabs (Devices, Activities, Remote, Settings) plus modal flows for editing. Screen is 240×320. Uses LVGL v8.3.
+
+> **Note for AI assistants:** `setup_ui.cpp` is ~184KB. Read specific sections rather than the whole file when possible. Use grep to locate relevant functions before reading.
 
 ### Build Configuration (`platformio.ini`)
 
-The V2 target `omote-v2-esp32-s3` extends `esp32-s3-Rev5andHigher` and uses an explicit `build_src_filter` that cherry-picks specific HAL files from `hardware/ESP32/` plus all of `src_v2/`. Adding a new HAL module to V2 requires adding it to this filter.
+The V2 target `omote-v2-esp32-s3` extends `esp32-s3-Rev5andHigher` and uses an explicit `build_src_filter` that cherry-picks specific HAL files from `hardware/ESP32/` plus all of `src_v2/`. **Adding a new HAL module to V2 requires adding it to this filter.**
 
-Key build flags: `ENABLE_WIFI_AND_MQTT=1`, `ENABLE_KEYBOARD_BLE=1`, `ARDUINO_LOOP_STACK_SIZE=24576`. ESP32-S3 uses PSRAM for LVGL (128KB pool).
+Key build flags: `ENABLE_WIFI_AND_MQTT=1`, `ENABLE_KEYBOARD_BLE=1`, `ARDUINO_LOOP_STACK_SIZE=24576`. ESP32-S3 uses PSRAM for LVGL (128KB pool). The partition table `noota_16MB_custom.csv` provides a single large app partition (no OTA).
+
+Key library dependencies for V2: LovyanGFX (display), IRremoteESP8266 (IR), PubSubClient (MQTT), NimBLE-Arduino (BLE), SdFat (SD card), SparkFun MAX1704x (fuel gauge), Adafruit TCA8418 (keypad expander).
 
 ### Companion Webapp (`tools/omote-webapp/`)
 
 Browser-based configuration tool over USB serial. Python FastAPI server (`app.py`) bridges WebSocket ↔ serial via `serial_bridge.py`. Frontend is Alpine.js + Pico CSS (no build step) with tabs: Connection, Devices, Activities, Backup, Monitor. All files in `tools/omote-webapp/static/`.
+
+Frontend JS modules: `app.js` (init), `serial.js` (comms layer), `devices.js` (device CRUD UI), `activities.js` (activity CRUD UI), `backup.js` (backup/restore UI), `monitor.js` (serial log viewer).
 
 Start: `cd tools/omote-webapp && pip install -r requirements.txt && python app.py` → `http://localhost:8080`
 
@@ -78,10 +140,34 @@ Phases 0-1, 3-5, 7-10 completed. Phases 5-6 (MQTT/BLE) functional but labeled in
 
 ## Key Conventions
 
-- Registry/Storage separation: registries hold runtime state in memory; storage modules handle NVS persistence.
-- HAL filenames follow `<module>_hal_esp32.{h,cpp}` pattern.
-- LVGL is configured entirely via `-D` build flags (no `lv_conf.h`); see `platformio.ini` `[env]` section.
-- Device command payloads are transport-specific strings: raw hex for IR, `key:<action>`/`media:<action>`/`text:<value>` for BLE, `topic|payload` for MQTT.
-- SD icon pack at `/omote_v2_icons.csv` overrides generated button labels (format: `Command Name,LabelOrIconText`).
-- Serial protocol: `@@`-prefixed JSON lines over 115200 baud USB serial. See `src_v2/README.md` "Companion Webapp" section for command reference.
+- **Registry/Storage separation:** registries hold runtime state in memory; storage modules handle NVS persistence.
+- **HAL filenames** follow `<module>_hal_esp32.{h,cpp}` (ESP32) and `<module>_hal_windows_linux.{h,cpp}` (desktop) patterns.
+- **LVGL is configured entirely via `-D` build flags** (no `lv_conf.h`); see `platformio.ini` `[env]` section.
+- **Device command payloads** are transport-specific strings: raw hex for IR, `key:<action>`/`media:<action>`/`text:<value>` for BLE, `topic|payload` for MQTT.
+- **SD icon pack** at `/omote_v2_icons.csv` overrides generated button labels (format: `Command Name,LabelOrIconText`).
+- **Serial protocol:** `@@`-prefixed JSON lines over 115200 baud USB serial. See `src_v2/README.md` "Companion Webapp" section for command reference.
+- **V2 build_src_filter is explicit:** when adding new HAL modules to V2, you must add the source file to the `build_src_filter` in the `[env:omote-v2-esp32-s3]` section of `platformio.ini`.
 - **Keep `src_v2/README.md` updated** when making V2 changes — it is the canonical capability snapshot, roadmap, build instructions, and webapp documentation.
+
+## Common Tasks for AI Assistants
+
+### Adding a new serial command
+1. Add the command string to `SerialHandler::processLine()` in `src_v2/app/serial_handler.cpp`.
+2. Implement the handler method in the same file.
+3. Update the supported commands list in `src_v2/README.md`.
+4. Update the webapp frontend if the command should be exposed in the browser UI (`tools/omote-webapp/static/js/`).
+
+### Adding a new HAL module to V2
+1. Create `hardware/ESP32/<module>_hal_esp32.{h,cpp}`.
+2. Add the `.cpp` to `build_src_filter` in `platformio.ini` under `[env:omote-v2-esp32-s3]`.
+3. Add the include to `hardware/hardwareLayer.h` if needed.
+
+### Adding a new UI tab or modal in V2
+1. All UI lives in `src_v2/ui/setup_ui.cpp` — this is a large monolithic file.
+2. Search for existing tab/modal creation patterns (e.g., `lv_tabview_add_tab`) to follow conventions.
+3. LVGL v8.3 API reference applies.
+
+### Modifying the webapp frontend
+1. Frontend files are in `tools/omote-webapp/static/` — plain HTML/JS with Alpine.js, no build step.
+2. Each tab has its own JS module in `static/js/`.
+3. Serial protocol handling is in `static/js/serial.js`.
