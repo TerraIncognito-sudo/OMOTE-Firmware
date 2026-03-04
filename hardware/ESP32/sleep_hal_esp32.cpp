@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <driver/rtc_io.h>
 #include "SparkFunLIS3DH.h"
 #include "sleep_hal_esp32.h"
 // before going to sleep, some tasks have to be done
@@ -34,6 +35,36 @@ constexpr uint8_t kMinMotionThreshold = 120;
 constexpr uint8_t kSleepWakeThresholdReg = 0x58;
 // At 50Hz sample rate, 0x03 requires ~60 ms of sustained motion.
 constexpr uint8_t kSleepWakeDurationReg = 0x03;
+
+uint64_t gpio_mask(uint8_t gpio) {
+  return (1ULL << gpio);
+}
+
+uint64_t effective_wakeup_mask(bool include_imu_wakeup) {
+  uint64_t wake_mask = BUTTON_PIN_BITMASK;
+  if (!include_imu_wakeup) {
+    wake_mask &= ~gpio_mask(ACC_INT_GPIO);
+  }
+  // Keep at least one wake source active.
+  if (wake_mask == 0) wake_mask = BUTTON_PIN_BITMASK;
+  return wake_mask;
+}
+
+void configure_ext1_wakeup_pulls(uint64_t wake_mask, esp_sleep_ext1_wakeup_mode_t wake_mode) {
+  for (uint8_t gpio = 0; gpio < 64; ++gpio) {
+    if ((wake_mask & gpio_mask(gpio)) == 0) continue;
+    const gpio_num_t gpio_num = static_cast<gpio_num_t>(gpio);
+    rtc_gpio_init(gpio_num);
+    rtc_gpio_set_direction(gpio_num, RTC_GPIO_MODE_INPUT_ONLY);
+    if (wake_mode == ESP_EXT1_WAKEUP_ANY_LOW) {
+      rtc_gpio_pullup_en(gpio_num);
+      rtc_gpio_pulldown_dis(gpio_num);
+    } else {
+      rtc_gpio_pullup_dis(gpio_num);
+      rtc_gpio_pulldown_en(gpio_num);
+    }
+  }
+}
 }
 
 // is "lift to wake" enabled
@@ -218,11 +249,19 @@ void enterSleep(){
   gpio_hold_en((gpio_num_t)LCD_EN_GPIO);  
   gpio_deep_sleep_hold_en();
   
+  const uint64_t wake_mask = effective_wakeup_mask(wakeupByIMUEnabled);
   #if(OMOTE_HARDWARE_REV >= 5)
-  esp_sleep_enable_ext1_wakeup(BUTTON_PIN_BITMASK, ESP_EXT1_WAKEUP_ANY_LOW);
+  const esp_sleep_ext1_wakeup_mode_t wake_mode = ESP_EXT1_WAKEUP_ANY_LOW;
   #else
-  esp_sleep_enable_ext1_wakeup(BUTTON_PIN_BITMASK, ESP_EXT1_WAKEUP_ANY_HIGH);
+  const esp_sleep_ext1_wakeup_mode_t wake_mode = ESP_EXT1_WAKEUP_ANY_HIGH;
   #endif
+
+  configure_ext1_wakeup_pulls(wake_mask, wake_mode);
+  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+  esp_sleep_enable_ext1_wakeup(wake_mask, wake_mode);
+  Serial.printf("Sleep wake mask: 0x%llX (lift-to-wake %s)\r\n",
+                wake_mask,
+                wakeupByIMUEnabled ? "on" : "off");
 
   delay(100);
   // Sleep
@@ -243,16 +282,26 @@ void init_sleep_HAL() {
 
   // Find out wakeup cause
   if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT1) {
-    if (esp_sleep_get_ext1_wakeup_status() == (0x01<<ACC_INT_GPIO)) {
+    const uint64_t wake_status = esp_sleep_get_ext1_wakeup_status();
+    const bool woke_by_imu = (wake_status & gpio_mask(ACC_INT_GPIO)) != 0;
+    const bool woke_by_keypad = (wake_status & ~gpio_mask(ACC_INT_GPIO)) != 0;
+    if (woke_by_keypad) {
+      wakeup_reason = WAKEUP_BY_KEYPAD;
+    } else if (woke_by_imu) {
       wakeup_reason = WAKEUP_BY_IMU;
     } else {
-      wakeup_reason = WAKEUP_BY_KEYPAD;
+      wakeup_reason = WAKEUP_BY_RESET;
     }
+    Serial.printf("Wake EXT1 status: 0x%llX\r\n", wake_status);
   } else {
     wakeup_reason = WAKEUP_BY_RESET;
   }
   
+  #if(OMOTE_HARDWARE_REV >= 5)
+  pinMode(ACC_INT_GPIO, INPUT_PULLUP);
+  #else
   pinMode(ACC_INT_GPIO, INPUT);
+  #endif
 
   // Release GPIO hold in case we are coming out of standby
   #if(OMOTE_HARDWARE_REV < 5)

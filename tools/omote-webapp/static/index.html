@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OMOTE Companion</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+  <link rel="stylesheet" href="/css/app.css">
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+  <script src="/js/serial.js"></script>
+  <script src="/js/devices.js"></script>
+  <script src="/js/activities.js"></script>
+  <script src="/js/backup.js"></script>
+  <script src="/js/monitor.js"></script>
+  <script src="/js/app.js"></script>
+</head>
+<body x-data="app()">
+
+  <!-- Status bar -->
+  <header class="container status-bar">
+    <strong>OMOTE Companion</strong>
+    <span>
+      <span class="status-dot" :class="connected ? 'connected' : ''"></span>
+      <span x-text="connected ? 'Connected (' + connectedPort + ')' : 'Disconnected'"></span>
+    </span>
+    <span x-show="connected">
+      Battery: <span x-text="batteryPct"></span>%
+      <span x-show="batteryCharging"> (charging)</span>
+    </span>
+  </header>
+
+  <main class="container">
+    <!-- Tab navigation -->
+    <nav>
+      <ul>
+        <li><a href="#" :class="activeTab === 'connection' && 'tab-active'" @click.prevent="activeTab = 'connection'">Connection</a></li>
+        <li><a href="#" :class="activeTab === 'devices' && 'tab-active'" @click.prevent="activeTab = 'devices'">Devices</a></li>
+        <li><a href="#" :class="activeTab === 'activities' && 'tab-active'" @click.prevent="activeTab = 'activities'">Activities</a></li>
+        <li><a href="#" :class="activeTab === 'backup' && 'tab-active'" @click.prevent="activeTab = 'backup'">Backup</a></li>
+        <li><a href="#" :class="activeTab === 'monitor' && 'tab-active'" @click.prevent="activeTab = 'monitor'">Monitor</a></li>
+      </ul>
+    </nav>
+
+    <!-- Connection tab -->
+    <section x-show="activeTab === 'connection'">
+      <h2>Connection</h2>
+      <div class="grid">
+        <div>
+          <label>Serial Port
+            <select x-model="selectedPort">
+              <option value="">-- Select port --</option>
+              <template x-for="p in ports" :key="p.port">
+                <option :value="p.port" x-text="p.port + ' - ' + p.description + (p.is_esp32 ? ' (ESP32)' : '')"></option>
+              </template>
+            </select>
+          </label>
+          <button @click="fetchPorts()" class="secondary outline">Refresh Ports</button>
+        </div>
+        <div>
+          <template x-if="!connected">
+            <button @click="connectSerial()" :disabled="!selectedPort">Connect</button>
+          </template>
+          <template x-if="connected">
+            <button @click="disconnectSerial()" class="secondary">Disconnect</button>
+          </template>
+        </div>
+      </div>
+    </section>
+
+    <!-- Devices tab -->
+    <section x-show="activeTab === 'devices'" x-data="devicesComponent()" x-effect="if (activeTab === 'devices' && connected) loadDevices()">
+      <h2>Devices</h2>
+      <div class="two-column">
+        <div class="device-list">
+          <button @click="addDevice()" class="outline" style="margin-bottom:1rem">+ Add Device</button>
+          <table role="grid">
+            <thead><tr><th>Name</th><th>Type</th><th>Transport</th><th>Cmds</th><th></th></tr></thead>
+            <tbody>
+              <template x-for="d in devices" :key="d.id">
+                <tr @click="selectDevice(d.id)" style="cursor:pointer" :class="selectedDevice && selectedDevice.id === d.id ? 'selected-row' : ''">
+                  <td x-text="d.name"></td>
+                  <td x-text="d.type"></td>
+                  <td x-text="d.transport"></td>
+                  <td x-text="d.commands ? d.commands.length : '?'"></td>
+                  <td><button class="outline secondary small" @click.stop="deleteDevice(d.id)">Del</button></td>
+                </tr>
+              </template>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="device-detail" x-show="editMode">
+          <h3 x-text="editDevice.id ? 'Edit Device' : 'New Device'"></h3>
+          <label>Name <input type="text" x-model="editDevice.name"></label>
+          <label>Type
+            <select x-model="editDevice.type">
+              <option value="" disabled>-- Select --</option>
+              <template x-for="t in meta.deviceTypes ?? []"><option :value="t" x-text="t"></option></template>
+            </select>
+          </label>
+          <label>Transport
+            <select x-model="editDevice.transport">
+              <option value="" disabled>-- Select --</option>
+              <template x-for="t in meta.transports ?? []"><option :value="t" x-text="t"></option></template>
+            </select>
+          </label>
+          <label x-show="editDevice.transport === 'IR'">Protocol
+            <select x-model="editDevice.ir_protocol">
+              <option value="" disabled>-- Select --</option>
+              <template x-for="p in meta.protocols ?? []"><option :value="p" x-text="p"></option></template>
+            </select>
+          </label>
+          <label>Address <input type="text" x-model="editDevice.address"></label>
+          <label><input type="checkbox" x-model="editDevice.enabled"> Enabled</label>
+
+          <h4>Commands</h4>
+          <table class="command-table">
+            <thead><tr><th>Name</th><th>Payload</th><th></th><th></th></tr></thead>
+            <tbody>
+              <template x-for="(cmd, idx) in editDevice.commands" :key="idx">
+                <tr>
+                  <td><input type="text" x-model="cmd.name" placeholder="Command name"></td>
+                  <td><input type="text" x-model="cmd.payload" placeholder="Payload"></td>
+                  <td><button class="outline small" @click="testCommand(editDevice.id, cmd.name)" title="Send command from remote">Test</button></td>
+                  <td><button class="outline secondary small" @click="removeCommand(idx)">X</button></td>
+                </tr>
+              </template>
+            </tbody>
+          </table>
+          <button class="outline small" @click="addCommand()">+ Add Command</button>
+          <p x-show="testStatus" x-text="testStatus" style="margin-top:0.5rem;font-style:italic"></p>
+          <div style="margin-top:1rem">
+            <button @click="saveDevice()">Save</button>
+            <button class="secondary" @click="editMode = false">Cancel</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Activities tab -->
+    <section x-show="activeTab === 'activities'" x-data="activitiesComponent()" x-effect="if (activeTab === 'activities' && connected) loadActivities()">
+      <h2>Activities</h2>
+      <div class="two-column">
+        <div class="device-list">
+          <button @click="addActivity()" class="outline" style="margin-bottom:1rem">+ Add Activity</button>
+          <table role="grid">
+            <thead><tr><th>Name</th><th>Devices</th><th></th></tr></thead>
+            <tbody>
+              <template x-for="a in activities" :key="a.id">
+                <tr @click="selectActivity(a.id)" style="cursor:pointer">
+                  <td x-text="a.name"></td>
+                  <td x-text="a.device_ids ? a.device_ids.length : '?'"></td>
+                  <td><button class="outline secondary small" @click.stop="deleteActivity(a.id)">Del</button></td>
+                </tr>
+              </template>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="device-detail" x-show="editMode">
+          <h3 x-text="editActivity.id ? 'Edit Activity' : 'New Activity'"></h3>
+          <label>Name <input type="text" x-model="editActivity.name"></label>
+
+          <h4>Devices</h4>
+          <template x-for="d in availableDevices" :key="d.id">
+            <label>
+              <input type="checkbox" :value="d.id"
+                :checked="editActivity.device_ids?.includes(d.id)"
+                @change="toggleActivityDevice(d.id, $event.target.checked)">
+              <span x-text="d.name"></span>
+            </label>
+          </template>
+
+          <h4>Key Bindings</h4>
+          <table class="command-table">
+            <thead><tr><th>Key</th><th>Device</th><th>Command</th><th></th></tr></thead>
+            <tbody>
+              <template x-for="(b, idx) in editActivity.key_bindings" :key="idx">
+                <tr>
+                  <td>
+                    <select x-model="b.key_char" style="width:8rem">
+                      <option value="">--</option>
+                      <template x-for="pk in physicalKeys" :key="pk.char">
+                        <option :value="pk.char" x-text="pk.label + ' (' + pk.char + ')'"></option>
+                      </template>
+                    </select>
+                  </td>
+                  <td>
+                    <select x-model="b.device_id" @change="b.command_name = ''">
+                      <option value="">--</option>
+                      <template x-for="d in activityDevices()" :key="d.id">
+                        <option :value="d.id" x-text="d.name"></option>
+                      </template>
+                    </select>
+                  </td>
+                  <td>
+                    <select x-model="b.command_name">
+                      <option value="">--</option>
+                      <template x-for="c in deviceCommands(b.device_id)" :key="c">
+                        <option :value="c" x-text="c"></option>
+                      </template>
+                    </select>
+                  </td>
+                  <td><button class="outline secondary small" @click="removeBinding(idx)">X</button></td>
+                </tr>
+              </template>
+            </tbody>
+          </table>
+          <button class="outline small" @click="addBinding()">+ Add Binding</button>
+
+          <h4>Startup Actions</h4>
+          <table class="command-table">
+            <thead><tr><th>#</th><th>Device</th><th>Command</th><th></th></tr></thead>
+            <tbody>
+              <template x-for="(s, idx) in editActivity.startup_actions" :key="idx">
+                <tr>
+                  <td x-text="idx + 1"></td>
+                  <td>
+                    <select x-model="s.device_id" @change="s.command_name = ''">
+                      <option value="">--</option>
+                      <template x-for="d in activityDevices()" :key="d.id">
+                        <option :value="d.id" x-text="d.name"></option>
+                      </template>
+                    </select>
+                  </td>
+                  <td>
+                    <select x-model="s.command_name">
+                      <option value="">--</option>
+                      <template x-for="c in deviceCommands(s.device_id)" :key="c">
+                        <option :value="c" x-text="c"></option>
+                      </template>
+                    </select>
+                  </td>
+                  <td><button class="outline secondary small" @click="removeStartup(idx)">X</button></td>
+                </tr>
+              </template>
+            </tbody>
+          </table>
+          <button class="outline small" @click="addStartup()">+ Add Startup Action</button>
+
+          <div style="margin-top:1rem">
+            <button @click="saveActivity()">Save</button>
+            <button class="secondary" @click="editMode = false">Cancel</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Backup tab -->
+    <section x-show="activeTab === 'backup'" x-data="backupComponent()">
+      <h2>Backup & Restore</h2>
+      <div class="grid">
+        <div>
+          <button @click="createBackup()">Create SD Backup</button>
+          <button class="secondary" @click="listBackups()">Refresh List</button>
+          <button class="outline" @click="exportCurrentState()">Export Current State</button>
+        </div>
+        <div>
+          <label>Import Backup
+            <input type="file" accept=".json,.txt" @change="importBackup($event.target.files[0])">
+          </label>
+          <label>Upload Icon Pack (CSV)
+            <input type="file" accept=".csv" @change="uploadIconPack($event.target.files[0])">
+          </label>
+          <progress x-show="uploading" :value="uploadProgress" max="100"></progress>
+        </div>
+      </div>
+      <p x-show="status" x-text="status"></p>
+      <div x-show="backups.length > 0">
+        <div style="display:flex;gap:0.5rem;align-items:center;margin-bottom:0.5rem">
+          <button class="outline small" @click="exportSelected()" :disabled="selectedBackups.length === 0">
+            Download Selected (<span x-text="selectedBackups.length"></span>)
+          </button>
+        </div>
+        <table role="grid">
+          <thead><tr><th style="width:2rem"></th><th>Backup</th><th>Path</th><th></th></tr></thead>
+          <tbody>
+            <template x-for="b in backups" :key="b.path">
+              <tr :class="isSelected(b.path) ? 'selected-row' : ''">
+                <td><input type="checkbox" :checked="isSelected(b.path)" @change="toggleBackupSelection(b.path)"></td>
+                <td x-text="b.label"></td>
+                <td x-text="b.path" style="font-size:0.85em"></td>
+                <td><button class="outline small" @click="restoreBackup(b.path)">Restore</button></td>
+              </tr>
+            </template>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Monitor tab -->
+    <section x-show="activeTab === 'monitor'" x-data="monitorComponent()" x-init="init()">
+      <h2>Monitor</h2>
+      <div style="display:flex;gap:0.5rem;margin-bottom:0.5rem;align-items:center">
+        <input type="text" x-model="filter" placeholder="Filter logs..." style="margin-bottom:0">
+        <button class="outline small" @click="togglePause()" x-text="paused ? 'Resume' : 'Pause'"></button>
+        <button class="outline secondary small" @click="clear()">Clear</button>
+      </div>
+      <div class="log-viewer" x-ref="logContainer">
+        <template x-for="(entry, idx) in filteredLogs()" :key="idx">
+          <div :class="'log-line log-' + entry.type">
+            <span class="log-ts" x-text="entry.timestamp"></span>
+            <span x-text="entry.text"></span>
+          </div>
+        </template>
+      </div>
+    </section>
+  </main>
+
+</body>
+</html>

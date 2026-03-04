@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <lvgl.h>
@@ -76,6 +77,7 @@ class SetupUi {
   static void on_settings_wifi_clicked(lv_event_t* event);
   static void on_settings_ble_clicked(lv_event_t* event);
   static void on_settings_mqtt_clicked(lv_event_t* event);
+  static void on_settings_icons_clicked(lv_event_t* event);
   static void on_settings_set_time_clicked(lv_event_t* event);
   static void on_settings_power_clicked(lv_event_t* event);
   static void on_settings_time_modal_close(lv_event_t* event);
@@ -112,6 +114,7 @@ class SetupUi {
   void rebuild_activity_list();
   void rebuild_remote_activity_dropdown();
   void rebuild_remote_command_buttons();
+  void refresh_remote_icon_overrides();
   void open_device_modal();
   void close_device_modal();
   bool save_device_modal();
@@ -280,6 +283,7 @@ class SetupUi {
   lv_obj_t* settings_wifi_btn_ = nullptr;
   lv_obj_t* settings_ble_btn_ = nullptr;
   lv_obj_t* settings_mqtt_btn_ = nullptr;
+  lv_obj_t* settings_icons_btn_ = nullptr;
   lv_obj_t* settings_power_btn_ = nullptr;
   lv_obj_t* settings_set_time_btn_ = nullptr;
   lv_obj_t* restore_modal_ = nullptr;
@@ -320,6 +324,7 @@ class SetupUi {
   std::vector<uint32_t> remote_device_ids_;
   std::vector<std::string> remote_command_names_;
   std::vector<lv_obj_t*> remote_command_buttons_;
+  std::unordered_map<std::string, std::string> remote_icon_overrides_;
   int remote_command_page_index_ = 0;
   char pending_keymap_key_char_ = '\0';
   uint32_t pending_keymap_device_id_ = 0;

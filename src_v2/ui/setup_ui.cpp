@@ -587,6 +587,7 @@ void SetupUi::init() {
   rebuild_device_list();
   rebuild_activity_list();
   rebuild_remote_activity_dropdown();
+  refresh_remote_icon_overrides();
   rebuild_remote_command_buttons();
   restore_ui_context();
   update_status_bar();
@@ -1049,9 +1050,18 @@ void SetupUi::build_settings_tab() {
   lv_label_set_text(mqtt_label, "MQTT Settings");
   lv_obj_center(mqtt_label);
 
+  settings_icons_btn_ = lv_btn_create(tab);
+  lv_obj_set_size(settings_icons_btn_, SCR_WIDTH - 16, btn_h);
+  lv_obj_align(settings_icons_btn_, LV_ALIGN_TOP_LEFT, 0, 246);
+  lv_obj_add_flag(settings_icons_btn_, LV_OBJ_FLAG_SCROLL_CHAIN_VER);
+  lv_obj_add_event_cb(settings_icons_btn_, on_settings_icons_clicked, LV_EVENT_CLICKED, this);
+  lv_obj_t* icons_label = lv_label_create(settings_icons_btn_);
+  lv_label_set_text(icons_label, "Reload Icon Pack");
+  lv_obj_center(icons_label);
+
   settings_set_time_btn_ = lv_btn_create(tab);
   lv_obj_set_size(settings_set_time_btn_, SCR_WIDTH - 16, btn_h);
-  lv_obj_align(settings_set_time_btn_, LV_ALIGN_TOP_LEFT, 0, 246);
+  lv_obj_align(settings_set_time_btn_, LV_ALIGN_TOP_LEFT, 0, 286);
   lv_obj_add_flag(settings_set_time_btn_, LV_OBJ_FLAG_SCROLL_CHAIN_VER);
   lv_obj_add_event_cb(settings_set_time_btn_, on_settings_set_time_clicked, LV_EVENT_CLICKED, this);
   lv_obj_t* set_time_label = lv_label_create(settings_set_time_btn_);
@@ -1060,7 +1070,7 @@ void SetupUi::build_settings_tab() {
 
   settings_power_btn_ = lv_btn_create(tab);
   lv_obj_set_size(settings_power_btn_, SCR_WIDTH - 16, btn_h);
-  lv_obj_align(settings_power_btn_, LV_ALIGN_TOP_LEFT, 0, 286);
+  lv_obj_align(settings_power_btn_, LV_ALIGN_TOP_LEFT, 0, 326);
   lv_obj_add_flag(settings_power_btn_, LV_OBJ_FLAG_SCROLL_CHAIN_VER);
   lv_obj_add_event_cb(settings_power_btn_, on_settings_power_clicked, LV_EVENT_CLICKED, this);
   lv_obj_t* power_label = lv_label_create(settings_power_btn_);
@@ -1071,7 +1081,7 @@ void SetupUi::build_settings_tab() {
   lv_label_set_text(settings_status_, "Status: idle");
   lv_obj_set_width(settings_status_, SCR_WIDTH - 16);
   lv_label_set_long_mode(settings_status_, LV_LABEL_LONG_WRAP);
-  lv_obj_align(settings_status_, LV_ALIGN_TOP_LEFT, 0, 326);
+  lv_obj_align(settings_status_, LV_ALIGN_TOP_LEFT, 0, 366);
 }
 
 void SetupUi::rebuild_device_list() {
@@ -1142,6 +1152,17 @@ void SetupUi::rebuild_remote_activity_dropdown() {
   }
   remote_command_page_index_ = 0;
   rebuild_remote_command_buttons();
+}
+
+void SetupUi::refresh_remote_icon_overrides() {
+  remote_icon_overrides_.clear();
+  std::string icon_status;
+  if (!sd_backup_.load_icon_pack(&remote_icon_overrides_, &icon_status)) {
+    return;
+  }
+  if (settings_status_ != nullptr && !icon_status.empty()) {
+    lv_label_set_text(settings_status_, icon_status.c_str());
+  }
 }
 
 void SetupUi::rebuild_remote_command_buttons() {
@@ -1245,7 +1266,13 @@ void SetupUi::rebuild_remote_command_buttons() {
     lv_obj_set_size(btn, btn_w, btn_h);
     lv_obj_align(btn, LV_ALIGN_TOP_LEFT, x, y);
     lv_obj_t* label = lv_label_create(btn);
-    lv_label_set_text(label, command_name.c_str());
+    const std::string command_key = lower_copy(trim_copy(command_name));
+    auto icon_it = remote_icon_overrides_.find(command_key);
+    if (icon_it != remote_icon_overrides_.end() && !icon_it->second.empty()) {
+      lv_label_set_text(label, icon_it->second.c_str());
+    } else {
+      lv_label_set_text(label, command_name.c_str());
+    }
     lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
     lv_obj_set_width(label, btn_w - 6);
     lv_obj_center(label);
@@ -2929,6 +2956,7 @@ void SetupUi::perform_sd_restore() {
   rebuild_device_list();
   rebuild_activity_list();
   rebuild_remote_activity_dropdown();
+  refresh_remote_icon_overrides();
   save_ui_context();
   close_sd_restore_modal();
   if (normalized) {
@@ -4336,6 +4364,13 @@ void SetupUi::on_settings_mqtt_clicked(lv_event_t* event) {
   SetupUi* self = static_cast<SetupUi*>(lv_event_get_user_data(event));
   if (self == nullptr) return;
   self->open_mqtt_modal();
+}
+
+void SetupUi::on_settings_icons_clicked(lv_event_t* event) {
+  SetupUi* self = static_cast<SetupUi*>(lv_event_get_user_data(event));
+  if (self == nullptr) return;
+  self->refresh_remote_icon_overrides();
+  self->rebuild_remote_command_buttons();
 }
 
 void SetupUi::on_settings_set_time_clicked(lv_event_t* event) {

@@ -10,8 +10,10 @@
 #include <cstring>
 #include <cstdlib>
 #include <ctime>
+#include <set>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "hardwareLayer.h"
@@ -21,12 +23,17 @@ namespace omote_v2 {
 namespace {
 constexpr const char* kLegacyBackupPath = "/omote_v2_backup.txt";
 constexpr const char* kBackupPrefix = "/omote_v2_backup_";
-constexpr const char* kBackupSuffix = ".txt";
+constexpr const char* kBackupSuffixText = ".txt";
+constexpr const char* kBackupSuffixJson = ".json";
 constexpr const char* kBackupIndexPath = "/omote_v2_backup_index.txt";
 constexpr const char* kHeader = "OMOTEV2_BACKUP_V1";
+constexpr const char* kHeaderV2 = "OMOTEV2_BACKUP_V2";
+constexpr const char* kSyncHookPath = "/omote_v2_sync_hook.json";
+constexpr const char* kIconPackPath = "/omote_v2_icons.csv";
 constexpr size_t kMaxDevices = 24;
 constexpr size_t kMaxActivities = 12;
 constexpr size_t kMaxBackupEntries = 48;
+constexpr size_t kMaxBackupFileBytes = 256 * 1024;
 constexpr time_t kMinValidEpoch = 1704067200;  // 2024-01-01 00:00:00 UTC
 SdFs g_sd;
 
@@ -77,6 +84,87 @@ std::vector<std::string> split(const std::string& in, char delim) {
   std::string token;
   while (std::getline(ss, token, delim)) out.push_back(token);
   return out;
+}
+
+std::string trim_copy(const std::string& in) {
+  size_t start = 0;
+  while (start < in.size() && (in[start] == ' ' || in[start] == '\t')) ++start;
+  size_t end = in.size();
+  while (end > start && (in[end - 1] == ' ' || in[end - 1] == '\t')) --end;
+  return in.substr(start, end - start);
+}
+
+std::string lower_copy(const std::string& in) {
+  std::string out = in;
+  std::transform(out.begin(), out.end(), out.begin(), [](unsigned char c) {
+    if (c >= 'A' && c <= 'Z') return static_cast<char>(c - 'A' + 'a');
+    return static_cast<char>(c);
+  });
+  return out;
+}
+
+std::string json_escape(const std::string& in) {
+  std::string out;
+  out.reserve(in.size() + 16);
+  for (char c : in) {
+    switch (c) {
+      case '\"':
+        out += "\\\"";
+        break;
+      case '\\':
+        out += "\\\\";
+        break;
+      case '\n':
+        out += "\\n";
+        break;
+      case '\r':
+        out += "\\r";
+        break;
+      case '\t':
+        out += "\\t";
+        break;
+      default:
+        out.push_back(c);
+        break;
+    }
+  }
+  return out;
+}
+
+bool json_unescape(const std::string& in, std::string* out) {
+  if (out == nullptr) return false;
+  out->clear();
+  out->reserve(in.size());
+  for (size_t i = 0; i < in.size(); ++i) {
+    if (in[i] != '\\') {
+      out->push_back(in[i]);
+      continue;
+    }
+    if (i + 1 >= in.size()) return false;
+    char esc = in[++i];
+    switch (esc) {
+      case 'n':
+        out->push_back('\n');
+        break;
+      case 'r':
+        out->push_back('\r');
+        break;
+      case 't':
+        out->push_back('\t');
+        break;
+      case '\\':
+        out->push_back('\\');
+        break;
+      case '"':
+        out->push_back('"');
+        break;
+      default:
+        // Keep unknown escape as-is to preserve payload data.
+        out->push_back(esc);
+        break;
+    }
+  }
+  return true;
 }
 
 bool parse_u32_token(const std::string& token, uint32_t* out) {
@@ -319,28 +407,50 @@ std::string build_backup_token(bool* out_has_valid_time) {
   return stamp;
 }
 
-std::string build_backup_path_from_token(const std::string& token) {
-  return std::string(kBackupPrefix) + token + kBackupSuffix;
+std::string build_backup_text_path_from_token(const std::string& token) {
+  return std::string(kBackupPrefix) + token + kBackupSuffixText;
 }
 
-bool is_structured_backup_path(const std::string& path) {
+std::string build_backup_json_path_from_token(const std::string& token) {
+  return std::string(kBackupPrefix) + token + kBackupSuffixJson;
+}
+
+bool is_structured_backup_path_with_suffix(const std::string& path, const std::string& suffix) {
   const std::string prefix = kBackupPrefix;
-  const std::string suffix = kBackupSuffix;
   return path.size() > prefix.size() + suffix.size() &&
          path.rfind(prefix, 0) == 0 &&
          path.compare(path.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+bool is_structured_backup_path(const std::string& path) {
+  return is_structured_backup_path_with_suffix(path, kBackupSuffixText) ||
+         is_structured_backup_path_with_suffix(path, kBackupSuffixJson);
+}
+
+bool is_json_backup_path(const std::string& path) {
+  return is_structured_backup_path_with_suffix(path, kBackupSuffixJson);
+}
+
+std::string backup_token_from_path(const std::string& path) {
+  const std::string prefix = kBackupPrefix;
+  if (is_structured_backup_path_with_suffix(path, kBackupSuffixText)) {
+    return path.substr(prefix.size(), path.size() - prefix.size() - strlen(kBackupSuffixText));
+  }
+  if (is_structured_backup_path_with_suffix(path, kBackupSuffixJson)) {
+    return path.substr(prefix.size(), path.size() - prefix.size() - strlen(kBackupSuffixJson));
+  }
+  return "";
 }
 
 std::string backup_label_from_path(const std::string& path) {
   if (path == kLegacyBackupPath) return "Legacy backup";
   if (!is_structured_backup_path(path)) return path;
 
-  const std::string prefix = kBackupPrefix;
-  const std::string suffix = kBackupSuffix;
-  const std::string token = path.substr(prefix.size(), path.size() - prefix.size() - suffix.size());
+  const std::string token = backup_token_from_path(path);
+  const bool is_json = is_json_backup_path(path);
 
   if (token.rfind("unsynced_", 0) == 0) {
-    return "Unsynced " + token.substr(strlen("unsynced_"));
+    return std::string(is_json ? "Unsynced JSON " : "Unsynced ") + token.substr(strlen("unsynced_"));
   }
 
   if (token.size() == 15 && token[8] == '_') {
@@ -366,10 +476,10 @@ std::string backup_label_from_path(const std::string& path) {
       pretty.append(token.substr(11, 2));
       pretty.push_back(':');
       pretty.append(token.substr(13, 2));
-      return pretty;
+      return pretty + (is_json ? " (JSON)" : "");
     }
   }
-  return token;
+  return token + (is_json ? " (JSON)" : "");
 }
 
 bool path_exists(const std::string& path) {
@@ -426,99 +536,300 @@ bool parse_backup_file(const std::string& backup_path, std::vector<DeviceRecord>
     set_status(out_status, "SD restore failed: backup missing");
     return false;
   }
+  if (file.size() > kMaxBackupFileBytes) {
+    file.close();
+    set_status(out_status, "SD restore failed: file too large");
+    return false;
+  }
 
+  std::vector<std::string> lines;
   String line;
-  if (!read_line(&file, &line)) {
-    file.close();
-    set_status(out_status, "SD restore failed: bad header");
-    return false;
-  }
-  line.trim();
-  if (line != kHeader) {
-    file.close();
-    set_status(out_status, "SD restore failed: bad header");
-    return false;
-  }
-
-  if (!read_line(&file, &line)) {
-    file.close();
-    set_status(out_status, "SD restore failed: invalid device count");
-    return false;
-  }
-  line.trim();
-  uint32_t expected_devices = 0;
-  if (!parse_count_line(std::string(line.c_str()), "DEVICES ", &expected_devices) || expected_devices > kMaxDevices) {
-    file.close();
-    set_status(out_status, "SD restore failed: invalid device count");
-    return false;
-  }
-
-  std::vector<DeviceRecord> devices;
-  devices.reserve(expected_devices);
-  for (uint32_t i = 0; i < expected_devices; ++i) {
-    String row;
-    if (!read_line(&file, &row)) {
+  while (read_line(&file, &line)) {
+    line.trim();
+    lines.push_back(std::string(line.c_str()));
+    if (lines.size() > 4096) {
       file.close();
-      set_status(out_status, "SD restore failed: invalid device row");
+      set_status(out_status, "SD restore failed: file has too many lines");
       return false;
     }
-    row.trim();
-    DeviceRecord parsed;
-    if (!parse_device_line(std::string(row.c_str()), &parsed)) {
-      file.close();
-      set_status(out_status, "SD restore failed: invalid device row");
-      return false;
-    }
-    devices.push_back(parsed);
   }
-
-  if (!read_line(&file, &line)) {
-    file.close();
-    set_status(out_status, "SD restore failed: invalid activity count");
-    return false;
-  }
-  line.trim();
-  uint32_t expected_activities = 0;
-  if (!parse_count_line(std::string(line.c_str()), "ACTIVITIES ", &expected_activities) || expected_activities > kMaxActivities) {
-    file.close();
-    set_status(out_status, "SD restore failed: invalid activity count");
-    return false;
-  }
-
-  std::vector<ActivityRecord> activities;
-  activities.reserve(expected_activities);
-  for (uint32_t i = 0; i < expected_activities; ++i) {
-    String row;
-    if (!read_line(&file, &row)) {
-      file.close();
-      set_status(out_status, "SD restore failed: invalid activity row");
-      return false;
-    }
-    row.trim();
-    ActivityRecord parsed;
-    if (!parse_activity_line(std::string(row.c_str()), &parsed)) {
-      file.close();
-      set_status(out_status, "SD restore failed: invalid activity row");
-      return false;
-    }
-    activities.push_back(parsed);
-  }
-
-  if (!read_line(&file, &line)) {
-    file.close();
-    set_status(out_status, "SD restore failed: missing end marker");
-    return false;
-  }
-  line.trim();
   file.close();
-  if (line != "END") {
-    set_status(out_status, "SD restore failed: missing end marker");
+  if (lines.empty()) {
+    set_status(out_status, "SD restore failed: empty backup");
     return false;
   }
 
-  *out_devices = std::move(devices);
-  *out_activities = std::move(activities);
+  auto validate_loaded_records = [&](const std::vector<DeviceRecord>& devices, const std::vector<ActivityRecord>& activities) -> bool {
+    if (devices.size() > kMaxDevices || activities.size() > kMaxActivities) {
+      set_status(out_status, "SD restore failed: record limits exceeded");
+      return false;
+    }
+    std::set<uint32_t> device_ids;
+    for (const DeviceRecord& device : devices) {
+      if (device.id == 0) {
+        set_status(out_status, "SD restore failed: device id is zero");
+        return false;
+      }
+      if (!device_ids.insert(device.id).second) {
+        set_status(out_status, "SD restore failed: duplicate device id");
+        return false;
+      }
+    }
+    std::set<uint32_t> activity_ids;
+    for (const ActivityRecord& activity : activities) {
+      if (activity.id == 0) {
+        set_status(out_status, "SD restore failed: activity id is zero");
+        return false;
+      }
+      if (!activity_ids.insert(activity.id).second) {
+        set_status(out_status, "SD restore failed: duplicate activity id");
+        return false;
+      }
+    }
+    return true;
+  };
+
+  auto parse_backup_lines = [&](const std::vector<std::string>& source_lines, std::vector<DeviceRecord>* devices_out,
+                                std::vector<ActivityRecord>* activities_out) -> bool {
+    if (devices_out == nullptr || activities_out == nullptr) return false;
+    size_t line_index = 0;
+    auto next_line = [&](std::string* out) -> bool {
+      if (out == nullptr || line_index >= source_lines.size()) return false;
+      *out = source_lines[line_index++];
+      return true;
+    };
+
+    std::string row;
+    if (!next_line(&row)) {
+      set_status(out_status, "SD restore failed: bad header");
+      return false;
+    }
+    if (row != kHeader && row != kHeaderV2) {
+      set_status(out_status, "SD restore failed: unsupported header");
+      return false;
+    }
+
+    uint32_t schema_version = 1;
+    if (!next_line(&row)) {
+      set_status(out_status, "SD restore failed: invalid device count");
+      return false;
+    }
+    if (row.rfind("SCHEMA ", 0) == 0) {
+      if (!parse_u32_token(row.substr(strlen("SCHEMA ")), &schema_version)) {
+        set_status(out_status, "SD restore failed: invalid schema version");
+        return false;
+      }
+      if (schema_version < 1 || schema_version > 2) {
+        set_status(out_status, "SD restore failed: unsupported schema version");
+        return false;
+      }
+      if (!next_line(&row)) {
+        set_status(out_status, "SD restore failed: invalid device count");
+        return false;
+      }
+    }
+
+    uint32_t expected_devices = 0;
+    if (!parse_count_line(row, "DEVICES ", &expected_devices) || expected_devices > kMaxDevices) {
+      set_status(out_status, "SD restore failed: invalid device count");
+      return false;
+    }
+
+    std::vector<DeviceRecord> devices;
+    devices.reserve(expected_devices);
+    for (uint32_t i = 0; i < expected_devices; ++i) {
+      if (!next_line(&row)) {
+        set_status(out_status, "SD restore failed: invalid device row");
+        return false;
+      }
+      DeviceRecord parsed;
+      if (!parse_device_line(row, &parsed)) {
+        set_status(out_status, "SD restore failed: invalid device row");
+        return false;
+      }
+      devices.push_back(parsed);
+    }
+
+    if (!next_line(&row)) {
+      set_status(out_status, "SD restore failed: invalid activity count");
+      return false;
+    }
+    uint32_t expected_activities = 0;
+    if (!parse_count_line(row, "ACTIVITIES ", &expected_activities) || expected_activities > kMaxActivities) {
+      set_status(out_status, "SD restore failed: invalid activity count");
+      return false;
+    }
+
+    std::vector<ActivityRecord> activities;
+    activities.reserve(expected_activities);
+    for (uint32_t i = 0; i < expected_activities; ++i) {
+      if (!next_line(&row)) {
+        set_status(out_status, "SD restore failed: invalid activity row");
+        return false;
+      }
+      ActivityRecord parsed;
+      if (!parse_activity_line(row, &parsed)) {
+        set_status(out_status, "SD restore failed: invalid activity row");
+        return false;
+      }
+      activities.push_back(parsed);
+    }
+
+    if (!next_line(&row) || row != "END") {
+      set_status(out_status, "SD restore failed: missing end marker");
+      return false;
+    }
+
+    if (!validate_loaded_records(devices, activities)) return false;
+    *devices_out = std::move(devices);
+    *activities_out = std::move(activities);
+    return true;
+  };
+
+  if (!parse_backup_lines(lines, out_devices, out_activities)) return false;
   return true;
+}
+
+bool write_sync_hook(const std::string& event_name, const std::string& backup_path, const std::string& format, bool ok,
+                     size_t device_count, size_t activity_count) {
+  FsFile file = g_sd.open(kSyncHookPath, O_WRONLY | O_CREAT | O_TRUNC);
+  if (!file) return false;
+
+  time_t now = time(nullptr);
+  char ts[32];
+  ts[0] = '\0';
+  if (is_valid_time(now)) {
+    struct tm now_tm {};
+    localtime_r(&now, &now_tm);
+    strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &now_tm);
+  } else {
+    snprintf(ts, sizeof(ts), "unsynced_%010lu", static_cast<unsigned long>(millis()));
+  }
+
+  file.print("{\"event\":\"");
+  file.print(json_escape(event_name).c_str());
+  file.print("\",\"path\":\"");
+  file.print(json_escape(backup_path).c_str());
+  file.print("\",\"format\":\"");
+  file.print(json_escape(format).c_str());
+  file.print("\",\"ok\":");
+  file.print(ok ? "true" : "false");
+  file.print(",\"devices\":");
+  file.print(static_cast<unsigned>(device_count));
+  file.print(",\"activities\":");
+  file.print(static_cast<unsigned>(activity_count));
+  file.print(",\"timestamp\":\"");
+  file.print(ts);
+  file.println("\"}");
+  file.close();
+  return true;
+}
+
+std::string serialize_text_backup_payload(const std::vector<DeviceRecord>& devices,
+                                          const std::vector<ActivityRecord>& activities) {
+  std::stringstream ss;
+  ss << kHeaderV2 << "\n";
+  ss << "SCHEMA 2\n";
+  ss << "DEVICES " << devices.size() << "\n";
+  for (const DeviceRecord& device : devices) {
+    ss << serialize_device_line(device).c_str() << "\n";
+  }
+  ss << "ACTIVITIES " << activities.size() << "\n";
+  for (const ActivityRecord& activity : activities) {
+    ss << serialize_activity_line(activity).c_str() << "\n";
+  }
+  ss << "END\n";
+  return ss.str();
+}
+
+bool extract_json_string_field(const std::string& json, const std::string& key, std::string* out_value) {
+  if (out_value == nullptr) return false;
+  const std::string pattern = "\"" + key + "\"";
+  size_t key_pos = json.find(pattern);
+  if (key_pos == std::string::npos) return false;
+  size_t colon = json.find(':', key_pos + pattern.size());
+  if (colon == std::string::npos) return false;
+  size_t first_quote = json.find('"', colon + 1);
+  if (first_quote == std::string::npos) return false;
+
+  std::string encoded;
+  bool escape = false;
+  for (size_t i = first_quote + 1; i < json.size(); ++i) {
+    char c = json[i];
+    if (escape) {
+      encoded.push_back('\\');
+      encoded.push_back(c);
+      escape = false;
+      continue;
+    }
+    if (c == '\\') {
+      escape = true;
+      continue;
+    }
+    if (c == '"') {
+      return json_unescape(encoded, out_value);
+    }
+    encoded.push_back(c);
+  }
+  return false;
+}
+
+bool parse_json_backup_file(const std::string& backup_path, std::vector<DeviceRecord>* out_devices,
+                            std::vector<ActivityRecord>* out_activities, std::string* out_status) {
+  FsFile file = g_sd.open(backup_path.c_str(), O_RDONLY);
+  if (!file) {
+    set_status(out_status, "SD restore failed: backup missing");
+    return false;
+  }
+  if (file.size() > kMaxBackupFileBytes) {
+    file.close();
+    set_status(out_status, "SD restore failed: JSON file too large");
+    return false;
+  }
+
+  std::string json_raw;
+  json_raw.reserve(static_cast<size_t>(file.size()) + 8);
+  while (file.available()) {
+    int c = file.read();
+    if (c < 0) break;
+    json_raw.push_back(static_cast<char>(c));
+  }
+  file.close();
+  if (trim_copy(json_raw).empty()) {
+    set_status(out_status, "SD restore failed: JSON backup is empty");
+    return false;
+  }
+
+  std::string payload_text;
+  if (!extract_json_string_field(json_raw, "payload", &payload_text)) {
+    set_status(out_status, "SD restore failed: JSON payload missing");
+    return false;
+  }
+
+  std::vector<std::string> lines;
+  std::stringstream ss(payload_text);
+  std::string row;
+  while (std::getline(ss, row)) {
+    if (!row.empty() && row.back() == '\r') row.pop_back();
+    lines.push_back(row);
+  }
+  if (lines.empty()) {
+    set_status(out_status, "SD restore failed: JSON payload empty");
+    return false;
+  }
+
+  // Reuse text parser by writing a temporary in-memory parse flow.
+  const std::string temp_path = "/.omote_tmp_payload.txt";
+  FsFile tmp = g_sd.open(temp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC);
+  if (!tmp) {
+    set_status(out_status, "SD restore failed: JSON temp write");
+    return false;
+  }
+  tmp.print(payload_text.c_str());
+  tmp.close();
+  const bool ok = parse_backup_file(temp_path, out_devices, out_activities, out_status);
+  g_sd.remove(temp_path.c_str());
+  return ok;
 }
 }  // namespace
 
@@ -536,34 +847,38 @@ bool SdBackupService::backup_to_sd(const std::vector<DeviceRecord>& devices, con
   }
 
   bool has_valid_time = false;
-  const std::string backup_path = build_backup_path_from_token(build_backup_token(&has_valid_time));
-  FsFile file = g_sd.open(backup_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC);
+  const std::string token = build_backup_token(&has_valid_time);
+  const std::string text_path = build_backup_text_path_from_token(token);
+  const std::string json_path = build_backup_json_path_from_token(token);
+  const std::string text_payload = serialize_text_backup_payload(devices, activities);
+
+  FsFile file = g_sd.open(text_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC);
   if (!file) {
     set_status(out_status, "SD backup failed: open write");
     return false;
   }
-
-  file.println(kHeader);
-  file.print("DEVICES ");
-  file.println(static_cast<unsigned>(devices.size()));
-  for (const DeviceRecord& device : devices) {
-    file.println(serialize_device_line(device));
-  }
-  file.print("ACTIVITIES ");
-  file.println(static_cast<unsigned>(activities.size()));
-  for (const ActivityRecord& activity : activities) {
-    file.println(serialize_activity_line(activity));
-  }
-  file.println("END");
+  file.print(text_payload.c_str());
   file.close();
 
+  FsFile json_file = g_sd.open(json_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC);
+  if (!json_file) {
+    set_status(out_status, "SD backup failed: open JSON write");
+    return false;
+  }
+  json_file.print("{\"format\":\"omote_v2_backup\",\"container_schema\":1,\"data_schema\":2,\"payload\":\"");
+  json_file.print(json_escape(text_payload).c_str());
+  json_file.println("\"}");
+  json_file.close();
+
   std::vector<std::string> index = load_backup_index();
-  prepend_backup_index(&index, backup_path);
+  prepend_backup_index(&index, json_path);
+  prepend_backup_index(&index, text_path);
   const bool index_saved = save_backup_index(index);
+  (void)write_sync_hook("backup", text_path, "txt+json", true, devices.size(), activities.size());
 
   if (has_valid_time) {
     if (index_saved) {
-      set_status(out_status, "SD backup saved: " + backup_path);
+      set_status(out_status, "SD backup saved: " + text_path + " (+ JSON)");
     } else {
       set_status(out_status, "SD backup saved, index update failed");
     }
@@ -592,12 +907,36 @@ bool SdBackupService::list_backups(std::vector<SdBackupEntry>* out_backups, std:
   }
 
   std::vector<std::string> index = load_backup_index();
+  std::set<std::string> seen;
   for (const std::string& path : index) {
     if (!path_exists(path)) continue;
+    if (seen.find(path) != seen.end()) continue;
     SdBackupEntry entry;
     entry.path = path;
     entry.label = backup_label_from_path(path);
     out_backups->push_back(entry);
+    seen.insert(path);
+
+    // If text backup is indexed, also surface sibling JSON backup (and vice versa).
+    const std::string token = backup_token_from_path(path);
+    if (!token.empty()) {
+      const std::string sibling_text = build_backup_text_path_from_token(token);
+      const std::string sibling_json = build_backup_json_path_from_token(token);
+      if (path != sibling_text && path_exists(sibling_text) && seen.find(sibling_text) == seen.end()) {
+        SdBackupEntry text_entry;
+        text_entry.path = sibling_text;
+        text_entry.label = backup_label_from_path(sibling_text);
+        out_backups->push_back(text_entry);
+        seen.insert(sibling_text);
+      }
+      if (path != sibling_json && path_exists(sibling_json) && seen.find(sibling_json) == seen.end()) {
+        SdBackupEntry json_entry;
+        json_entry.path = sibling_json;
+        json_entry.label = backup_label_from_path(sibling_json);
+        out_backups->push_back(json_entry);
+        seen.insert(sibling_json);
+      }
+    }
   }
 
   if (out_backups->empty() && path_exists(kLegacyBackupPath)) {
@@ -635,13 +974,161 @@ bool SdBackupService::restore_from_sd(const std::string& backup_path, std::vecto
 
   std::vector<DeviceRecord> devices;
   std::vector<ActivityRecord> activities;
-  if (!parse_backup_file(backup_path, &devices, &activities, out_status)) {
+  const bool is_json = is_json_backup_path(backup_path);
+  const bool parse_ok = is_json
+                            ? parse_json_backup_file(backup_path, &devices, &activities, out_status)
+                            : parse_backup_file(backup_path, &devices, &activities, out_status);
+  if (!parse_ok) {
+    (void)write_sync_hook("restore", backup_path, is_json ? "json" : "txt", false, 0, 0);
     return false;
   }
 
   *out_devices = std::move(devices);
   *out_activities = std::move(activities);
+  (void)write_sync_hook("restore", backup_path, is_json ? "json" : "txt", true, out_devices->size(), out_activities->size());
   set_status(out_status, "SD restore complete: " + backup_label_from_path(backup_path));
+  return true;
+}
+
+bool SdBackupService::load_icon_pack(std::unordered_map<std::string, std::string>* out_icon_overrides, std::string* out_status) const {
+  if (out_icon_overrides == nullptr) {
+    set_status(out_status, "Icon pack load failed: invalid output");
+    return false;
+  }
+  out_icon_overrides->clear();
+
+  if (!mount_sd(out_status)) {
+    if (out_status != nullptr && out_status->empty()) {
+      set_status(out_status, "Icon pack load failed: card init");
+    }
+    return false;
+  }
+  if (!path_exists(kIconPackPath)) {
+    set_status(out_status, "Icon pack not found");
+    return false;
+  }
+
+  FsFile file = g_sd.open(kIconPackPath, O_RDONLY);
+  if (!file) {
+    set_status(out_status, "Icon pack load failed: open");
+    return false;
+  }
+
+  String line;
+  size_t count = 0;
+  while (read_line(&file, &line)) {
+    std::string row = trim_copy(std::string(line.c_str()));
+    if (row.empty() || row[0] == '#') continue;
+    const size_t comma = row.find(',');
+    if (comma == std::string::npos) continue;
+    const std::string command_name = trim_copy(row.substr(0, comma));
+    const std::string icon_text = trim_copy(row.substr(comma + 1));
+    if (command_name.empty() || icon_text.empty()) continue;
+    (*out_icon_overrides)[lower_copy(command_name)] = icon_text;
+    ++count;
+    if (count >= 256) break;
+  }
+  file.close();
+
+  set_status(out_status, count > 0 ? ("Icon pack loaded: " + std::to_string(static_cast<unsigned long>(count)) + " entries")
+                                   : "Icon pack loaded: 0 entries");
+  return true;
+}
+
+std::string SdBackupService::serialize_to_text(const std::vector<DeviceRecord>& devices,
+                                               const std::vector<ActivityRecord>& activities) {
+  return serialize_text_backup_payload(devices, activities);
+}
+
+bool SdBackupService::parse_from_text(const std::string& text, std::vector<DeviceRecord>* out_devices,
+                                      std::vector<ActivityRecord>* out_activities, std::string* out_status) {
+  if (out_devices == nullptr || out_activities == nullptr) {
+    set_status(out_status, "Parse failed: invalid output");
+    return false;
+  }
+
+  std::vector<std::string> lines;
+  std::stringstream ss(text);
+  std::string row;
+  while (std::getline(ss, row)) {
+    if (!row.empty() && row.back() == '\r') row.pop_back();
+    lines.push_back(row);
+  }
+  if (lines.empty()) {
+    set_status(out_status, "Parse failed: empty input");
+    return false;
+  }
+
+  // Reuse the same parsing logic as parse_backup_file's inner lambda.
+  size_t line_index = 0;
+  auto next_line = [&](std::string* out) -> bool {
+    if (out == nullptr || line_index >= lines.size()) return false;
+    *out = lines[line_index++];
+    return true;
+  };
+
+  std::string header_row;
+  if (!next_line(&header_row) || (header_row != kHeader && header_row != kHeaderV2)) {
+    set_status(out_status, "Parse failed: bad header");
+    return false;
+  }
+
+  std::string count_row;
+  uint32_t schema_version = 1;
+  if (!next_line(&count_row)) {
+    set_status(out_status, "Parse failed: truncated");
+    return false;
+  }
+  if (count_row.rfind("SCHEMA ", 0) == 0) {
+    if (!parse_u32_token(count_row.substr(strlen("SCHEMA ")), &schema_version) || schema_version < 1 || schema_version > 2) {
+      set_status(out_status, "Parse failed: bad schema");
+      return false;
+    }
+    if (!next_line(&count_row)) {
+      set_status(out_status, "Parse failed: truncated");
+      return false;
+    }
+  }
+
+  uint32_t expected_devices = 0;
+  if (!parse_count_line(count_row, "DEVICES ", &expected_devices) || expected_devices > kMaxDevices) {
+    set_status(out_status, "Parse failed: bad device count");
+    return false;
+  }
+
+  std::vector<DeviceRecord> devices;
+  devices.reserve(expected_devices);
+  for (uint32_t i = 0; i < expected_devices; ++i) {
+    if (!next_line(&row)) { set_status(out_status, "Parse failed: truncated device"); return false; }
+    DeviceRecord parsed;
+    if (!parse_device_line(row, &parsed)) { set_status(out_status, "Parse failed: bad device line"); return false; }
+    devices.push_back(parsed);
+  }
+
+  if (!next_line(&count_row)) { set_status(out_status, "Parse failed: truncated"); return false; }
+  uint32_t expected_activities = 0;
+  if (!parse_count_line(count_row, "ACTIVITIES ", &expected_activities) || expected_activities > kMaxActivities) {
+    set_status(out_status, "Parse failed: bad activity count");
+    return false;
+  }
+
+  std::vector<ActivityRecord> activities;
+  activities.reserve(expected_activities);
+  for (uint32_t i = 0; i < expected_activities; ++i) {
+    if (!next_line(&row)) { set_status(out_status, "Parse failed: truncated activity"); return false; }
+    ActivityRecord parsed;
+    if (!parse_activity_line(row, &parsed)) { set_status(out_status, "Parse failed: bad activity line"); return false; }
+    activities.push_back(parsed);
+  }
+
+  if (!next_line(&row) || row != "END") {
+    set_status(out_status, "Parse failed: missing END");
+    return false;
+  }
+
+  *out_devices = std::move(devices);
+  *out_activities = std::move(activities);
+  set_status(out_status, "Parse OK");
   return true;
 }
 

@@ -9,6 +9,8 @@
 #include "app/activity_registry.h"
 #include "app/command_dispatcher.h"
 #include "app/device_registry.h"
+#include "app/sd_backup_service.h"
+#include "app/serial_handler.h"
 #include "ui/setup_ui.h"
 
 using namespace omote_v2;
@@ -16,6 +18,8 @@ using namespace omote_v2;
 DeviceRegistry g_registry;
 ActivityRegistry g_activity_registry;
 CommandDispatcher g_dispatcher(g_registry);
+SdBackupService g_backup_service;
+SerialHandler g_serial(g_registry, g_activity_registry, g_dispatcher, g_backup_service);
 SetupUi* g_ui = nullptr;
 
 enum keypad_rawKeyStatesV2 {IDLE_RAW_V2, PRESSED_RAW_V2, RELEASED_RAW_V2};
@@ -186,5 +190,6 @@ void loop() {
     }
   }
   g_ui->tick();
+  g_serial.poll();
   delay(5);
 }

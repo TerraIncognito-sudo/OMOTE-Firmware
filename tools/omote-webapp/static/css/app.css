@@ -1,0 +1,108 @@
+/* OMOTE Companion - minimal overrides for Pico CSS */
+
+.status-bar {
+  display: flex;
+  flex-direction: row;
+  gap: 1rem;
+  align-items: center;
+  padding-top: 0.5rem;
+  padding-bottom: 0.5rem;
+  border-bottom: 1px solid var(--pico-muted-border-color);
+  margin-bottom: 1rem;
+}
+
+.status-dot {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--pico-del-color, #c62828);
+}
+
+.status-dot.connected {
+  background: #2e7d32;
+}
+
+.tab-active {
+  font-weight: bold;
+  text-decoration: underline;
+}
+
+/* Two-column layout for list + detail panels */
+.two-column {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+@media (min-width: 768px) {
+  .two-column {
+    flex-direction: row;
+  }
+  .two-column > .device-list {
+    flex: 0 0 45%;
+    max-height: 70vh;
+    overflow-y: auto;
+  }
+  .two-column > .device-detail {
+    flex: 1;
+  }
+}
+
+.device-list table {
+  font-size: 0.9rem;
+}
+
+.selected-row {
+  background: var(--pico-primary-focus);
+}
+
+.command-table {
+  font-size: 0.85rem;
+}
+
+.command-table input[type="text"] {
+  padding: 0.25rem 0.5rem;
+  margin-bottom: 0;
+}
+
+.command-table select {
+  padding: 0.25rem 0.5rem;
+  margin-bottom: 0;
+}
+
+button.small, .small {
+  padding: 0.25rem 0.5rem;
+  font-size: 0.8rem;
+}
+
+/* Log viewer */
+.log-viewer {
+  font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+  background: #1a1a2e;
+  color: #e0e0e0;
+  padding: 0.75rem;
+  border-radius: 0.25rem;
+  overflow-y: auto;
+  max-height: 500px;
+  font-size: 0.8rem;
+  line-height: 1.4;
+}
+
+.log-line {
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.log-ts {
+  color: #666;
+  margin-right: 0.5rem;
+}
+
+.log-response {
+  color: #64b5f6;
+}
+
+.log-log {
+  color: #a5d6a7;
+}

@@ -90,7 +90,7 @@ void init_keys_HAL(void) {
   keypad.pinMode(6, INPUT_PULLUP);  // SD_DET
   keypad.pinMode(13, INPUT); // USB_3V3
 
-  pinMode(TCA_INT_GPIO, INPUT);
+  pinMode(TCA_INT_GPIO, INPUT_PULLUP);
   keypad.flush();
   keypad.writeRegister(TCA8418_REG_CFG, 0b00000001);
   keypad.writeRegister(TCA8418_REG_GPI_EM_1, 0b00111111);

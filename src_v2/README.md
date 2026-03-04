@@ -26,10 +26,13 @@ The end state is:
 - `Devices`: add/remove/rename devices, edit named commands, add/remove command names
 - `Activities`: add/remove/rename activities, map physical keys, define startup steps
 - `Remote`: choose device and trigger generated command buttons from mapped named commands
-- `Settings`: timestamped SD backup, selectable SD restore, WiFi settings (scan/select/password/connect), BLE settings (advertise/stop/disconnect/bonds), MQTT broker settings (host/port/auth/client), manual time + timezone set, power settings (sleep timeout + command debounce + lift-to-wake)
+- `Settings`: timestamped SD backup, selectable SD restore, WiFi settings (scan/select/password/connect), BLE settings (advertise/stop/disconnect/bonds), MQTT broker settings (host/port/auth/client), icon pack reload, manual time + timezone set, power settings (sleep timeout + command debounce + lift-to-wake)
 - Backup behavior:
 - each backup is saved as its own timestamped file
 - restore flow opens a backup picker so you can choose which backup to restore
+- backups are exported as both text and JSON containers for portability
+- restore supports both legacy V1 text backups and current schema-backed backups
+- backup/restore writes a sync hook file (`/omote_v2_sync_hook.json`) for external tooling
 - Activity switching behavior:
 - activity selection is managed from `Activities`
 - startup actions execute on activity change
@@ -42,6 +45,16 @@ The end state is:
 - command buttons are generated from each device's saved named commands (no hardcoded runtime button list)
 - generated command pages support pagination for larger command sets
 - generated command order prioritizes common command names, then custom commands
+- optional SD icon pack (`/omote_v2_icons.csv`) can override generated button labels/icons
+- Companion webapp (`tools/omote-webapp/`):
+- browser-based configuration over USB serial (no firmware rebuild needed)
+- serial command protocol: `@@`-prefixed JSON lines, 25 commands covering device/activity CRUD, dispatch, backup, SD file transfer
+- Python FastAPI server bridges WebSocket ↔ serial
+- Alpine.js + Pico CSS frontend with tabs: Connection, Devices, Activities, Backup, Monitor
+- device and activity editing with full command/key-binding/startup-action management
+- SD backup create/list/restore, serial export/import (no SD needed), icon pack upload with progress
+- live serial monitor with filter/pause
+- serial activity keeps device awake (resets sleep timer)
 - Status and lifecycle:
 - battery percent/charging indicator in top bar
 - top-bar clock (`HH:MM`) from system time
@@ -76,16 +89,55 @@ The end state is:
 
 ## Build and Flash
 
-1. Build:
-   - `pio run -e omote-v2-esp32-s3`
-2. Upload:
+1. Build and upload:
    - `pio run -e omote-v2-esp32-s3 -t upload`
-3. Basic on-device validation:
+2. Basic on-device validation:
    - Add one IR device in `Devices`
    - In `Edit`, add command name + payload
    - Create activity in `Activities`
    - Map one physical key to that device command
    - Select device in `Remote` and test on-screen + physical key behavior
+
+## Companion Webapp
+
+A browser-based configuration tool that connects to the OMOTE over USB serial.
+
+### Architecture
+
+```
+Browser (HTML/JS/Alpine.js)
+    ↕ WebSocket
+Python FastAPI server (tools/omote-webapp/)
+    ↕ USB Serial (115200 baud)
+ESP32-S3 firmware serial handler (src_v2/app/serial_handler.{h,cpp})
+    ↕ existing registries
+DeviceRegistry / ActivityRegistry / SdBackupService / CommandDispatcher
+```
+
+### Serial Protocol
+
+All protocol messages are single lines prefixed with `@@` and terminated by `\n`. Existing `Serial.println()` debug output does not start with `@@`, so the webapp separates protocol from logs trivially.
+
+- Request: `@@{"cmd":"ping"}\n`
+- Response: `@@{"res":"ping","ok":true,"data":{"uptime_ms":12345}}\n`
+
+Supported commands: `ping`, `status`, `meta`, `dev_list`, `dev_get`, `dev_add`, `dev_update`, `dev_delete`, `act_list`, `act_get`, `act_add`, `act_update`, `act_delete`, `dispatch`, `backup_sd`, `backup_list`, `restore_sd`, `backup_export`, `backup_import`, `sd_write_start`, `sd_write_chunk`, `sd_write_end`, `sd_read_start`, `sd_read_chunk`, `sd_read_end`.
+
+### Verification Steps
+
+1. **Firmware build:** `pio run -e omote-v2-esp32-s3 -t upload`
+2. **Webapp start:** `cd tools/omote-webapp && pip install -r requirements.txt && python app.py` (or `C:\Users\yick1\.platformio\penv\Scripts\python.exe app.py`) → `http://localhost:8080`
+3. **End-to-end:** Connect via webapp, test device list, add/edit devices
+
+## SD Icon Pack Format
+
+- File path: `/omote_v2_icons.csv` on SD root
+- Format per line: `Command Name,LabelOrIconText`
+- Example:
+  - `Power,[PWR]`
+  - `Volume Up,+`
+  - `Mute,M`
+- Use `Settings -> Reload Icon Pack` after updating the file.
 
 ## Definition of "Fully Implemented Product"
 
@@ -312,6 +364,7 @@ Done when:
 ### Phase 10: Backup/Restore and Data Portability Completion
 
 Depends on: Phase 9
+Status: `completed`
 
 Objective:
 - make data movement and recovery production-grade
