@@ -105,7 +105,7 @@
             </select>
           </label>
           <label x-show="editDevice.transport === 'IR'">Protocol
-            <select x-model="editDevice.ir_protocol">
+            <select x-model="editDevice.ir_protocol_name">
               <option value="" disabled>-- Select --</option>
               <template x-for="p in meta.protocols ?? []"><option :value="p" x-text="p"></option></template>
             </select>
@@ -210,13 +210,13 @@
 
           <h4>Startup Actions</h4>
           <table class="command-table">
-            <thead><tr><th>#</th><th>Device</th><th>Command</th><th></th></tr></thead>
+            <thead><tr><th>#</th><th>Device</th><th>Slot</th><th></th></tr></thead>
             <tbody>
               <template x-for="(s, idx) in editActivity.startup_actions" :key="idx">
                 <tr>
                   <td x-text="idx + 1"></td>
                   <td>
-                    <select x-model="s.device_id" @change="s.command_name = ''">
+                    <select x-model="s.device_id" @change="s.slot = ''">
                       <option value="">--</option>
                       <template x-for="d in activityDevices()" :key="d.id">
                         <option :value="d.id" x-text="d.name"></option>
@@ -224,10 +224,10 @@
                     </select>
                   </td>
                   <td>
-                    <select x-model="s.command_name">
+                    <select x-model="s.slot">
                       <option value="">--</option>
-                      <template x-for="c in deviceCommands(s.device_id)" :key="c">
-                        <option :value="c" x-text="c"></option>
+                      <template x-for="cs in meta.commandSlots ?? []" :key="cs">
+                        <option :value="cs" x-text="cs"></option>
                       </template>
                     </select>
                   </td>

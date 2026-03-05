@@ -43,10 +43,10 @@ function app() {
         }
         if (resp.res === 'meta') {
           if (d.device_types) this.meta.deviceTypes = d.device_types;
-          if (d.transports) this.meta.transports = d.transports;
-          if (d.protocols) this.meta.protocols = d.protocols;
+          if (d.transport_types) this.meta.transports = d.transport_types;
+          if (d.ir_protocols) this.meta.protocols = d.ir_protocols.map(p => p.name || p);
           if (d.command_slots) this.meta.commandSlots = d.command_slots;
-          if (d.command_names) this.meta.commandNames = d.command_names;
+          if (d.common_commands) this.meta.commandNames = d.common_commands;
         }
       });
     },
@@ -90,10 +90,10 @@ function app() {
         const resp = await window.omoteSerial.send('meta');
         const d = resp.data || {};
         if (d.device_types) this.meta.deviceTypes = d.device_types;
-        if (d.transports) this.meta.transports = d.transports;
-        if (d.protocols) this.meta.protocols = d.protocols;
+        if (d.transport_types) this.meta.transports = d.transport_types;
+        if (d.ir_protocols) this.meta.protocols = d.ir_protocols.map(p => p.name || p);
         if (d.command_slots) this.meta.commandSlots = d.command_slots;
-        if (d.command_names) this.meta.commandNames = d.command_names;
+        if (d.common_commands) this.meta.commandNames = d.common_commands;
       } catch (e) {
         console.warn('Meta fetch failed:', e.message);
       }

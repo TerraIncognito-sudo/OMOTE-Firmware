@@ -114,6 +114,8 @@ ESP32-S3 firmware serial handler (src_v2/app/serial_handler.{h,cpp})
 DeviceRegistry / ActivityRegistry / SdBackupService / CommandDispatcher
 ```
 
+Each tab component (`devicesComponent`, `activitiesComponent`) is self-contained: it owns its own `meta` data and fetches it via `send('meta')` alongside its primary data load. Do not rely on the root `app()` scope for shared reactive data — Alpine.js nested `x-data` components cannot reliably access parent scope reactive properties.
+
 ### Serial Protocol
 
 All protocol messages are single lines prefixed with `@@` and terminated by `\n`. Existing `Serial.println()` debug output does not start with `@@`, so the webapp separates protocol from logs trivially.
@@ -123,10 +125,20 @@ All protocol messages are single lines prefixed with `@@` and terminated by `\n`
 
 Supported commands: `ping`, `status`, `meta`, `dev_list`, `dev_get`, `dev_add`, `dev_update`, `dev_delete`, `act_list`, `act_get`, `act_add`, `act_update`, `act_delete`, `dispatch`, `backup_sd`, `backup_list`, `restore_sd`, `backup_export`, `backup_import`, `sd_write_start`, `sd_write_chunk`, `sd_write_end`, `sd_read_start`, `sd_read_chunk`, `sd_read_end`.
 
+#### Firmware Field Names (important for webapp ↔ firmware alignment)
+
+- **`meta` response** returns `device_types` (string array), `transport_types` (string array), `ir_protocols` (array of `{id, name}` objects), `command_slots` (string array), `common_commands` (string array).
+- **Device CRUD** uses `dev_id` as the device identifier field (not `id`, which is reserved for the request correlation ID).
+- **Activity CRUD** uses `act_id` as the activity identifier field.
+- **`dispatch`** expects `device_id` (int) and `command` (string) — note: the field is `command`, not `command_name`.
+- **Key bindings** use `key` (ASCII int), `device_id` (int), `command_name` (string).
+- **Startup actions** use `device_id` (int) and `slot` (CommandSlot string, e.g. `"Power"`, `"VolumeUp"`).
+- **IR protocol** can be sent as `ir_protocol` (int ID) or `ir_protocol_name` (string like `"NEC"`) — the firmware resolves either.
+
 ### Verification Steps
 
 1. **Firmware build:** `pio run -e omote-v2-esp32-s3 -t upload`
-2. **Webapp start:** `cd tools/omote-webapp && pip install -r requirements.txt && python app.py` (or `C:\Users\yick1\.platformio\penv\Scripts\python.exe app.py`) → `http://localhost:8080`
+2. **Webapp start:** `cd tools/omote-webapp && pip install -r requirements.txt && python app.py` (or `C:\Users\**useraccount**\.platformio\penv\Scripts\python.exe app.py`) → `http://localhost:8080`
 3. **End-to-end:** Connect via webapp, test device list, add/edit devices
 
 ## SD Icon Pack Format

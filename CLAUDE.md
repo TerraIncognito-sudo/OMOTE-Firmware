@@ -83,5 +83,7 @@ Phases 0-1, 3-5, 7-10 completed. Phases 5-6 (MQTT/BLE) functional but labeled in
 - LVGL is configured entirely via `-D` build flags (no `lv_conf.h`); see `platformio.ini` `[env]` section.
 - Device command payloads are transport-specific strings: raw hex for IR, `key:<action>`/`media:<action>`/`text:<value>` for BLE, `topic|payload` for MQTT.
 - SD icon pack at `/omote_v2_icons.csv` overrides generated button labels (format: `Command Name,LabelOrIconText`).
-- Serial protocol: `@@`-prefixed JSON lines over 115200 baud USB serial. See `src_v2/README.md` "Companion Webapp" section for command reference.
+- Serial protocol: `@@`-prefixed JSON lines over 115200 baud USB serial. See `src_v2/README.md` "Companion Webapp" section for command reference and field name mapping.
+- Webapp ↔ firmware field alignment: firmware uses `dev_id`/`act_id` (not `id`) for entity identifiers in CRUD commands, `command` (not `command_name`) for dispatch, `key` (ASCII int) for key bindings, `slot` (CommandSlot string) for startup actions, and `ir_protocol_name` (string) for IR protocol. The `meta` response returns `transport_types` and `ir_protocols` (array of `{id, name}` objects).
+- Webapp Alpine.js scoping: each tab component (`devicesComponent`, `activitiesComponent`) owns its own `meta` data and fetches it via `send('meta')` during its load function. Do NOT rely on parent `app()` scope for shared data — nested `x-data` components cannot reliably access parent reactive properties. Each component must be self-contained.
 - **Keep `src_v2/README.md` updated** when making V2 changes — it is the canonical capability snapshot, roadmap, build instructions, and webapp documentation.

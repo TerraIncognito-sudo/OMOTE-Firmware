@@ -9,6 +9,7 @@ function activitiesComponent() {
     editActivity: {},
     availableDevices: [],
     _deviceCommandCache: {},
+    meta: { commandSlots: [] },
     _loaded: false,
 
     // Physical keypad keys with labels (Rev5 layout)
@@ -51,10 +52,12 @@ function activitiesComponent() {
       if (this._loaded) return;
       this._loaded = true;
       try {
-        const resp = await window.omoteSerial.send('act_list');
-        this.activities = (resp.data && resp.data.activities) || [];
-        // Also load devices for reference
-        const devResp = await window.omoteSerial.send('dev_list');
+        const [actResp, devResp, metaResp] = await Promise.all([
+          window.omoteSerial.send('act_list'),
+          window.omoteSerial.send('dev_list'),
+          window.omoteSerial.send('meta')
+        ]);
+        this.activities = (actResp.data && actResp.data.activities) || [];
         this.availableDevices = (devResp.data && devResp.data.devices) || [];
         // Cache commands per device
         this._deviceCommandCache = {};
@@ -63,6 +66,8 @@ function activitiesComponent() {
             this._deviceCommandCache[d.id] = d.commands.map(c => c.name || c);
           }
         }
+        const m = metaResp.data || {};
+        if (m.command_slots) this.meta.commandSlots = m.command_slots;
       } catch (e) {
         console.error('Failed to load activities', e);
         this._loaded = false;
@@ -83,8 +88,8 @@ function activitiesComponent() {
       this.editActivity.device_ids = this.editActivity.device_ids || [];
       this.editActivity.key_bindings = (this.editActivity.key_bindings || []).map(kb => ({
         ...kb,
-        // Firmware sends key_char as ASCII int; normalize to single char string for dropdown
-        key_char: typeof kb.key_char === 'number' ? String.fromCharCode(kb.key_char) : kb.key_char
+        // Firmware sends "key" as ASCII int; normalize to single char string for dropdown
+        key_char: typeof kb.key === 'number' ? String.fromCharCode(kb.key) : (kb.key_char || '')
       }));
       this.editActivity.startup_actions = this.editActivity.startup_actions || [];
       this.editMode = true;
@@ -131,7 +136,7 @@ function activitiesComponent() {
     },
 
     addStartup() {
-      this.editActivity.startup_actions.push({ device_id: '', command_name: '' });
+      this.editActivity.startup_actions.push({ device_id: '', slot: '' });
     },
 
     removeStartup(index) {
@@ -146,14 +151,14 @@ function activitiesComponent() {
           name: a.name,
           device_ids: a.device_ids || [],
           key_bindings: (a.key_bindings || []).map(kb => ({
-            key_char: typeof kb.key_char === 'string' ? kb.key_char.charCodeAt(0) : kb.key_char,
+            key: typeof kb.key_char === 'string' ? kb.key_char.charCodeAt(0) : kb.key_char,
             device_id: kb.device_id,
             command_name: kb.command_name
           })),
           startup_actions: a.startup_actions || []
         };
         if (a.id) {
-          payload.id = a.id;
+          payload.act_id = a.id;
           await window.omoteSerial.send('act_update', payload);
         } else {
           await window.omoteSerial.send('act_add', payload);
@@ -168,7 +173,7 @@ function activitiesComponent() {
     async deleteActivity(id) {
       if (!confirm('Delete this activity?')) return;
       try {
-        await window.omoteSerial.send('act_delete', { activity_id: id });
+        await window.omoteSerial.send('act_delete', { act_id: id });
         if (this.selectedActivity && this.selectedActivity.id === id) {
           this.selectedActivity = null;
           this.editMode = false;

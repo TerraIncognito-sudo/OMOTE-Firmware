@@ -7,14 +7,22 @@ function devicesComponent() {
     selectedDevice: null,
     editMode: false,
     editDevice: {},
+    meta: { deviceTypes: [], transports: [], protocols: [] },
     _loaded: false,
 
     async loadDevices() {
       if (this._loaded) return;
       this._loaded = true;
       try {
-        const resp = await window.omoteSerial.send('dev_list');
-        this.devices = (resp.data && resp.data.devices) || [];
+        const [devResp, metaResp] = await Promise.all([
+          window.omoteSerial.send('dev_list'),
+          window.omoteSerial.send('meta')
+        ]);
+        this.devices = (devResp.data && devResp.data.devices) || [];
+        const m = metaResp.data || {};
+        if (m.device_types) this.meta.deviceTypes = m.device_types;
+        if (m.transport_types) this.meta.transports = m.transport_types;
+        if (m.ir_protocols) this.meta.protocols = m.ir_protocols.map(p => p.name || p);
       } catch (e) {
         console.error('Failed to load devices', e);
         this._loaded = false;
@@ -64,13 +72,13 @@ function devicesComponent() {
           name: d.name,
           type: d.type,
           transport: d.transport,
-          ir_protocol: d.ir_protocol || d.protocol || 'NEC',
+          ir_protocol_name: d.ir_protocol_name || d.ir_protocol || d.protocol || 'NEC',
           address: d.address || '',
           enabled: d.enabled !== false,
           commands: d.commands || []
         };
         if (d.id) {
-          payload.id = d.id;
+          payload.dev_id = d.id;
           await window.omoteSerial.send('dev_update', payload);
         } else {
           await window.omoteSerial.send('dev_add', payload);
@@ -85,7 +93,7 @@ function devicesComponent() {
     async deleteDevice(id) {
       if (!confirm('Delete this device?')) return;
       try {
-        await window.omoteSerial.send('dev_delete', { device_id: id });
+        await window.omoteSerial.send('dev_delete', { dev_id: id });
         if (this.selectedDevice && this.selectedDevice.id === id) {
           this.selectedDevice = null;
           this.editMode = false;
@@ -115,7 +123,7 @@ function devicesComponent() {
       try {
         const resp = await window.omoteSerial.send('dispatch', {
           device_id: deviceId,
-          command_name: commandName
+          command: commandName
         });
         const d = resp.data || {};
         this.testStatus = d.sent ? ('Sent: ' + commandName) : ('Failed: ' + (d.detail || 'unknown error'));
