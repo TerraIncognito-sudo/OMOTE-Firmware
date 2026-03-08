@@ -6,3 +6,7 @@
 .vscode/ipch
 src/secrets_override.h
 **/.DS_Store
+CLAUDE.md
+.claude
+.mcp.json
+.playwright-mcp/

@@ -16,6 +16,7 @@ class SerialHandler {
                 CommandDispatcher& dispatcher, SdBackupService& backup);
 
   void poll();
+  void on_ir_learned(const std::string& message);
 
  private:
   void process_line(const std::string& line);
@@ -53,6 +54,10 @@ class SerialHandler {
   void cmd_sd_read_start(const std::string& json, const std::string& id);
   void cmd_sd_read_chunk(const std::string& json, const std::string& id);
   void cmd_sd_read_end(const std::string& id);
+
+  void cmd_ir_learn_start(const std::string& id);
+  void cmd_ir_learn_stop(const std::string& id);
+  void stop_ir_learning_internal();
 
   // JSON helpers
   std::string device_to_json(const DeviceRecord& d);
@@ -99,6 +104,9 @@ class SerialHandler {
   std::string sd_transfer_path_;
   size_t sd_write_bytes_ = 0;
   size_t sd_read_size_ = 0;
+
+  // IR learning state
+  bool ir_learning_active_ = false;
 };
 
 }  // namespace omote_v2

@@ -10,6 +10,8 @@ function app() {
     selectedPort: '',
     batteryPct: 0,
     batteryCharging: false,
+    currentActivityName: localStorage.getItem('omote_current_activity_name') || '',
+    currentActivityId: localStorage.getItem('omote_current_activity_id') || '',
     meta: {
       deviceTypes: [],
       transports: [],
@@ -22,6 +24,12 @@ function app() {
     init() {
       this.fetchPorts();
       window.omoteSerial.connect();
+
+      // Listen for activity selection changes from the activities component
+      window.addEventListener('activity-changed', (e) => {
+        this.currentActivityId = e.detail.id;
+        this.currentActivityName = e.detail.name;
+      });
 
       window.omoteSerial.onStatus((data) => {
         this.connected = data.connected;

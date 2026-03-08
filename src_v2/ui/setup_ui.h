@@ -204,6 +204,7 @@ class SetupUi {
   lv_obj_t* wifi_status_label_ = nullptr;
   lv_obj_t* time_status_label_ = nullptr;
   lv_obj_t* battery_status_label_ = nullptr;
+  lv_obj_t* activity_status_label_ = nullptr;
   lv_obj_t* tabview_ = nullptr;
   lv_obj_t* devices_page_ = nullptr;
   lv_obj_t* activities_page_ = nullptr;

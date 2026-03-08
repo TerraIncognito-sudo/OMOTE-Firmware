@@ -544,31 +544,41 @@ void SetupUi::init() {
   lv_obj_set_style_bg_opa(root_, LV_OPA_COVER, LV_PART_MAIN);
 
   status_bar_ = lv_obj_create(root_);
-  lv_obj_set_size(status_bar_, SCR_WIDTH, 18);
+  lv_obj_set_size(status_bar_, SCR_WIDTH, 30);
   lv_obj_align(status_bar_, LV_ALIGN_TOP_MID, 0, 0);
   lv_obj_set_style_radius(status_bar_, 0, LV_PART_MAIN);
   lv_obj_set_style_pad_all(status_bar_, 2, LV_PART_MAIN);
   lv_obj_set_style_bg_color(status_bar_, lv_color_hex(0x1E1E1E), LV_PART_MAIN);
   lv_obj_clear_flag(status_bar_, LV_OBJ_FLAG_SCROLLABLE);
 
+  // Row 1: WiFi, time, battery
   wifi_status_label_ = lv_label_create(status_bar_);
   lv_obj_set_style_text_font(wifi_status_label_, &lv_font_montserrat_10, LV_PART_MAIN);
   lv_label_set_text(wifi_status_label_, "WiFi");
-  lv_obj_align(wifi_status_label_, LV_ALIGN_LEFT_MID, 2, 0);
+  lv_obj_align(wifi_status_label_, LV_ALIGN_TOP_LEFT, 2, 0);
 
   time_status_label_ = lv_label_create(status_bar_);
   lv_obj_set_style_text_font(time_status_label_, &lv_font_montserrat_10, LV_PART_MAIN);
   lv_label_set_text(time_status_label_, "--:--");
-  lv_obj_align(time_status_label_, LV_ALIGN_CENTER, 0, 0);
+  lv_obj_align(time_status_label_, LV_ALIGN_TOP_MID, 0, 0);
 
   battery_status_label_ = lv_label_create(status_bar_);
   lv_obj_set_style_text_font(battery_status_label_, &lv_font_montserrat_10, LV_PART_MAIN);
   lv_label_set_text(battery_status_label_, "Batt: --");
-  lv_obj_align(battery_status_label_, LV_ALIGN_RIGHT_MID, -2, 0);
+  lv_obj_align(battery_status_label_, LV_ALIGN_TOP_RIGHT, -2, 0);
+
+  // Row 2: current activity name
+  activity_status_label_ = lv_label_create(status_bar_);
+  lv_obj_set_style_text_font(activity_status_label_, &lv_font_montserrat_10, LV_PART_MAIN);
+  lv_obj_set_style_text_color(activity_status_label_, lv_color_hex(0x80C0FF), LV_PART_MAIN);
+  lv_label_set_text(activity_status_label_, "");
+  lv_obj_set_width(activity_status_label_, SCR_WIDTH - 8);
+  lv_label_set_long_mode(activity_status_label_, LV_LABEL_LONG_DOT);
+  lv_obj_align(activity_status_label_, LV_ALIGN_BOTTOM_LEFT, 2, 0);
 
   tabview_ = lv_tileview_create(root_);
-  lv_obj_set_size(tabview_, SCR_WIDTH, SCR_HEIGHT - 18);
-  lv_obj_align(tabview_, LV_ALIGN_TOP_MID, 0, 18);
+  lv_obj_set_size(tabview_, SCR_WIDTH, SCR_HEIGHT - 30);
+  lv_obj_align(tabview_, LV_ALIGN_TOP_MID, 0, 30);
   lv_obj_clear_flag(tabview_, LV_OBJ_FLAG_SCROLL_ELASTIC);
   lv_obj_set_scrollbar_mode(tabview_, LV_SCROLLBAR_MODE_OFF);
   lv_obj_add_event_cb(tabview_, on_tabview_changed, LV_EVENT_VALUE_CHANGED, this);
@@ -735,6 +745,15 @@ void SetupUi::update_status_bar() {
       }
     }
     last_wifi_connected_ = wifi_connected;
+  }
+
+  if (activity_status_label_ != nullptr) {
+    const ActivityRecord* act = selected_activity();
+    if (act) {
+      lv_label_set_text(activity_status_label_, act->name.c_str());
+    } else {
+      lv_label_set_text(activity_status_label_, "");
+    }
   }
 
   int battery_mv = 0;
@@ -968,11 +987,11 @@ void SetupUi::build_remote_tab() {
 
   remote_status_ = lv_label_create(tab);
   lv_label_set_text(remote_status_, "Select a device");
-  lv_obj_align(remote_status_, LV_ALIGN_TOP_LEFT, 0, 62);
+  lv_obj_align(remote_status_, LV_ALIGN_TOP_LEFT, 0, 70);
 
   remote_page_prev_btn_ = lv_btn_create(tab);
   lv_obj_set_size(remote_page_prev_btn_, 40, 20);
-  lv_obj_align(remote_page_prev_btn_, LV_ALIGN_TOP_LEFT, 0, 84);
+  lv_obj_align(remote_page_prev_btn_, LV_ALIGN_TOP_LEFT, 0, 92);
   lv_obj_add_event_cb(remote_page_prev_btn_, on_remote_page_prev, LV_EVENT_CLICKED, this);
   lv_obj_t* prev_text = lv_label_create(remote_page_prev_btn_);
   lv_label_set_text(prev_text, "<");
@@ -980,7 +999,7 @@ void SetupUi::build_remote_tab() {
 
   remote_page_next_btn_ = lv_btn_create(tab);
   lv_obj_set_size(remote_page_next_btn_, 40, 20);
-  lv_obj_align(remote_page_next_btn_, LV_ALIGN_TOP_RIGHT, 0, 84);
+  lv_obj_align(remote_page_next_btn_, LV_ALIGN_TOP_RIGHT, 0, 92);
   lv_obj_add_event_cb(remote_page_next_btn_, on_remote_page_next, LV_EVENT_CLICKED, this);
   lv_obj_t* next_text = lv_label_create(remote_page_next_btn_);
   lv_label_set_text(next_text, ">");
@@ -988,7 +1007,7 @@ void SetupUi::build_remote_tab() {
 
   remote_page_label_ = lv_label_create(tab);
   lv_label_set_text(remote_page_label_, "Page 1/1");
-  lv_obj_align(remote_page_label_, LV_ALIGN_TOP_MID, 0, 88);
+  lv_obj_align(remote_page_label_, LV_ALIGN_TOP_MID, 0, 96);
 }
 
 void SetupUi::build_settings_tab() {
@@ -1251,7 +1270,7 @@ void SetupUi::rebuild_remote_command_buttons() {
   const int pad = 4;
   const int btn_w = (SCR_WIDTH - 12 - (2 * pad)) / 3;
   const int btn_h = 30;
-  const int y_start = 108;
+  const int y_start = 116;
   int button_count = 0;
   const int start_index = remote_command_page_index_ * kPageSize;
   const int end_index = std::min(command_total, start_index + kPageSize);

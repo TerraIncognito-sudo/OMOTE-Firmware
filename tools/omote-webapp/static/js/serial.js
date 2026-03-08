@@ -67,7 +67,7 @@ class OmoteSerial {
     };
   }
 
-  send(cmd, params = {}) {
+  send(cmd, params = {}, timeout = 8000) {
     return new Promise((resolve, reject) => {
       if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
         reject(new Error('WebSocket not connected'));
@@ -82,7 +82,7 @@ class OmoteSerial {
         this._pending.delete(id);
         this._pending.delete(cmd);
         reject(new Error(`Timeout waiting for response to ${cmd}`));
-      }, 5000);
+      }, timeout);
 
       // Store under both id and cmd for flexible matching
       const entry = { resolve, reject, timer };

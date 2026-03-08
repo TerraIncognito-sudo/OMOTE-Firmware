@@ -65,6 +65,7 @@ function devicesComponent() {
     },
 
     async saveDevice() {
+      if (this.irLearning) await this.stopLearnIR();
       try {
         const d = this.editDevice;
         // Firmware expects device fields at top level of the JSON command
@@ -113,6 +114,64 @@ function devicesComponent() {
     },
 
     testStatus: '',
+    irLearning: false,
+    irLearnIndex: -1,
+    _irLearnCleanup: null,
+
+    async learnIR(idx) {
+      if (this.irLearning) {
+        await this.stopLearnIR();
+        return;
+      }
+      this.irLearning = true;
+      this.irLearnIndex = idx;
+      this.testStatus = 'IR Learn: point remote at OMOTE and press a button...';
+
+      // Listen for unsolicited ir_learned responses
+      const handler = (data) => {
+        if (data && data.res === 'ir_learned' && data.ok && data.data) {
+          const { protocol, payload } = data.data;
+          if (this.irLearnIndex >= 0 && this.irLearnIndex < this.editDevice.commands.length) {
+            this.editDevice.commands[this.irLearnIndex].payload = payload;
+          }
+          if (protocol && this.editDevice.transport === 'IR') {
+            this.editDevice.ir_protocol_name = protocol;
+          }
+          this.testStatus = 'IR Learned: ' + protocol + ' ' + payload;
+          this.irLearning = false;
+          this.irLearnIndex = -1;
+          setTimeout(() => { if (this.testStatus.startsWith('IR Learned')) this.testStatus = ''; }, 5000);
+        }
+      };
+      window.omoteSerial.onResponse(handler);
+      this._irLearnCleanup = () => {
+        const idx = window.omoteSerial._responseCbs.indexOf(handler);
+        if (idx >= 0) window.omoteSerial._responseCbs.splice(idx, 1);
+      };
+
+      try {
+        await window.omoteSerial.send('ir_learn_start');
+        // Auto-timeout after 10 seconds
+        setTimeout(() => {
+          if (this.irLearning) this.stopLearnIR();
+        }, 10000);
+      } catch (e) {
+        this.testStatus = 'IR Learn failed: ' + e.message;
+        this.irLearning = false;
+        this.irLearnIndex = -1;
+        if (this._irLearnCleanup) { this._irLearnCleanup(); this._irLearnCleanup = null; }
+      }
+    },
+
+    async stopLearnIR() {
+      if (this._irLearnCleanup) { this._irLearnCleanup(); this._irLearnCleanup = null; }
+      this.irLearning = false;
+      this.irLearnIndex = -1;
+      try {
+        await window.omoteSerial.send('ir_learn_stop');
+      } catch (e) { /* ignore */ }
+      if (this.testStatus.startsWith('IR Learn:')) this.testStatus = '';
+    },
 
     async testCommand(deviceId, commandName) {
       if (!deviceId || !commandName) {

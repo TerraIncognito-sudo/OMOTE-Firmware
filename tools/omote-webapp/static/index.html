@@ -9,6 +9,7 @@
   <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
   <script src="/js/serial.js"></script>
   <script src="/js/devices.js"></script>
+  <script src="/js/keymap.js"></script>
   <script src="/js/activities.js"></script>
   <script src="/js/backup.js"></script>
   <script src="/js/monitor.js"></script>
@@ -40,6 +41,12 @@
         <li><a href="#" :class="activeTab === 'monitor' && 'tab-active'" @click.prevent="activeTab = 'monitor'">Monitor</a></li>
       </ul>
     </nav>
+
+    <!-- Current activity bar -->
+    <div class="activity-bar" x-show="currentActivityName">
+      Current Activity: <strong x-text="currentActivityName"></strong>
+      <a href="#" class="small" @click.prevent="activeTab = 'activities'" x-show="activeTab !== 'activities'">Edit</a>
+    </div>
 
     <!-- Connection tab -->
     <section x-show="activeTab === 'connection'">
@@ -115,13 +122,14 @@
 
           <h4>Commands</h4>
           <table class="command-table">
-            <thead><tr><th>Name</th><th>Payload</th><th></th><th></th></tr></thead>
+            <thead><tr><th>Name</th><th>Payload</th><th></th><th></th><th></th></tr></thead>
             <tbody>
               <template x-for="(cmd, idx) in editDevice.commands" :key="idx">
                 <tr>
                   <td><input type="text" x-model="cmd.name" placeholder="Command name"></td>
                   <td><input type="text" x-model="cmd.payload" placeholder="Payload"></td>
                   <td><button class="outline small" @click="testCommand(editDevice.id, cmd.name)" title="Send command from remote">Test</button></td>
+                  <td x-show="editDevice.transport === 'IR'"><button class="outline small" @click="learnIR(idx)" :class="irLearning && irLearnIndex === idx ? 'contrast' : ''" :title="irLearning && irLearnIndex === idx ? 'Click to cancel' : 'Learn IR code from remote'" x-text="irLearning && irLearnIndex === idx ? 'Stop' : 'Learn'"></button></td>
                   <td><button class="outline secondary small" @click="removeCommand(idx)">X</button></td>
                 </tr>
               </template>
@@ -130,8 +138,8 @@
           <button class="outline small" @click="addCommand()">+ Add Command</button>
           <p x-show="testStatus" x-text="testStatus" style="margin-top:0.5rem;font-style:italic"></p>
           <div style="margin-top:1rem">
-            <button @click="saveDevice()">Save</button>
-            <button class="secondary" @click="editMode = false">Cancel</button>
+            <button type="button" @click="saveDevice()">Save</button>
+            <button type="button" class="secondary" @click="if (irLearning) stopLearnIR(); editMode = false">Cancel</button>
           </div>
         </div>
       </div>
@@ -172,41 +180,86 @@
           </template>
 
           <h4>Key Bindings</h4>
-          <table class="command-table">
-            <thead><tr><th>Key</th><th>Device</th><th>Command</th><th></th></tr></thead>
-            <tbody>
-              <template x-for="(b, idx) in editActivity.key_bindings" :key="idx">
-                <tr>
-                  <td>
-                    <select x-model="b.key_char" style="width:8rem">
-                      <option value="">--</option>
-                      <template x-for="pk in physicalKeys" :key="pk.char">
-                        <option :value="pk.char" x-text="pk.label + ' (' + pk.char + ')'"></option>
-                      </template>
-                    </select>
-                  </td>
-                  <td>
-                    <select x-model="b.device_id" @change="b.command_name = ''">
-                      <option value="">--</option>
-                      <template x-for="d in activityDevices()" :key="d.id">
-                        <option :value="d.id" x-text="d.name"></option>
-                      </template>
-                    </select>
-                  </td>
-                  <td>
-                    <select x-model="b.command_name">
-                      <option value="">--</option>
-                      <template x-for="c in deviceCommands(b.device_id)" :key="c">
-                        <option :value="c" x-text="c"></option>
-                      </template>
-                    </select>
-                  </td>
-                  <td><button class="outline secondary small" @click="removeBinding(idx)">X</button></td>
-                </tr>
-              </template>
-            </tbody>
-          </table>
-          <button class="outline small" @click="addBinding()">+ Add Binding</button>
+
+          <!-- Visual key map -->
+          <div class="keymap-container">
+            <div class="keymap-layout">
+              <div class="keymap-remote">
+                <div class="keymap-image-wrap" :style="'width:' + imgWidth + 'px; height:' + imgHeight + 'px'">
+                  <img src="/img/remote.png" :width="imgWidth" :height="imgHeight" alt="OMOTE Remote">
+                  <svg :viewBox="'0 0 ' + imgWidth + ' ' + imgHeight" class="keymap-svg"
+                    @click="handleKeymapClick($event)" x-html="renderKeymapSvg()">
+                  </svg>
+                </div>
+              </div>
+
+              <!-- Assignment panel -->
+              <div class="keymap-assign" x-show="selectedKey">
+                <h5>Assign: <span x-text="selectedKey ? selectedKey.label : ''"></span></h5>
+                <label>Device
+                  <select x-model="assignDeviceId" @change="assignCommandName = ''">
+                    <option value="">-- None --</option>
+                    <template x-for="d in activityDevices()" :key="d.id">
+                      <option :value="d.id" x-text="d.name"></option>
+                    </template>
+                  </select>
+                </label>
+                <label>Command
+                  <select x-model="assignCommandName">
+                    <option value="">-- None --</option>
+                    <template x-for="c in deviceCommands(assignDeviceId)" :key="c">
+                      <option :value="c" x-text="c"></option>
+                    </template>
+                  </select>
+                </label>
+                <div style="display:flex; gap:0.5rem; margin-top:0.5rem">
+                  <button class="small" @click="assignKey()">Apply</button>
+                  <button class="small outline secondary" @click="clearSelectedKey()">Clear</button>
+                  <button class="small outline" @click="cancelAssign()">Cancel</button>
+                </div>
+              </div>
+            </div>
+
+            <!-- Binding summary list -->
+            <details style="margin-top:0.5rem">
+              <summary>All bindings (table view)</summary>
+              <table class="command-table">
+                <thead><tr><th>Key</th><th>Device</th><th>Command</th><th></th></tr></thead>
+                <tbody>
+                  <template x-for="(b, idx) in editActivity.key_bindings" :key="idx">
+                    <tr>
+                      <td>
+                        <select x-model="b.key_char" style="width:8rem">
+                          <option value="">--</option>
+                          <template x-for="pk in physicalKeys" :key="pk.char">
+                            <option :value="pk.char" x-text="pk.label + ' (' + pk.char + ')'"></option>
+                          </template>
+                        </select>
+                      </td>
+                      <td>
+                        <select x-model="b.device_id" @change="b.command_name = ''">
+                          <option value="">--</option>
+                          <template x-for="d in activityDevices()" :key="d.id">
+                            <option :value="d.id" x-text="d.name"></option>
+                          </template>
+                        </select>
+                      </td>
+                      <td>
+                        <select x-model="b.command_name">
+                          <option value="">--</option>
+                          <template x-for="c in deviceCommands(b.device_id)" :key="c">
+                            <option :value="c" x-text="c"></option>
+                          </template>
+                        </select>
+                      </td>
+                      <td><button class="outline secondary small" @click="removeBinding(idx)">X</button></td>
+                    </tr>
+                  </template>
+                </tbody>
+              </table>
+              <button class="outline small" @click="addBinding()">+ Add Binding</button>
+            </details>
+          </div>
 
           <h4>Startup Actions</h4>
           <table class="command-table">
@@ -238,9 +291,10 @@
           </table>
           <button class="outline small" @click="addStartup()">+ Add Startup Action</button>
 
+          <p x-show="saveStatus" x-text="saveStatus" style="margin-top:0.5rem;font-style:italic"></p>
           <div style="margin-top:1rem">
-            <button @click="saveActivity()">Save</button>
-            <button class="secondary" @click="editMode = false">Cancel</button>
+            <button type="button" @click="saveActivity()">Save</button>
+            <button type="button" class="secondary" @click="editMode = false">Cancel</button>
           </div>
         </div>
       </div>

@@ -18,6 +18,9 @@ namespace omote_v2 {
 
 namespace {
 
+// Pointer to active SerialHandler for IR learning callback.
+SerialHandler* g_serial_ir_handler = nullptr;
+
 // SD filesystem instance for file transfer operations.
 SdFs g_serial_sd;
 FsFile g_transfer_file;
@@ -486,6 +489,9 @@ bool SerialHandler::json_to_activity(const std::string& json,
 // -------------------------------------------------------------------
 
 void SerialHandler::poll() {
+  if (ir_learning_active_) {
+    infraredReceiver_loop_HAL();
+  }
   if (!Serial.available()) return;
   // Keep device awake while serial is active.
   setLastActivityTimestamp_HAL();
@@ -545,6 +551,8 @@ void SerialHandler::handle_command(const std::string& json,
   else if (cmd == "sd_read_start") { cmd_sd_read_start(json, id); }
   else if (cmd == "sd_read_chunk") { cmd_sd_read_chunk(json, id); }
   else if (cmd == "sd_read_end") { cmd_sd_read_end(id); }
+  else if (cmd == "ir_learn_start") { cmd_ir_learn_start(id); }
+  else if (cmd == "ir_learn_stop") { cmd_ir_learn_stop(id); }
   else {
     send_err(cmd, id, "unknown command");
   }
@@ -1176,6 +1184,61 @@ void SerialHandler::cmd_sd_read_end(const std::string& id) {
   g_transfer_file.close();
   sd_read_open_ = false;
   send_ok("sd_read_end", id);
+}
+
+// -------------------------------------------------------------------
+// IR Learning
+// -------------------------------------------------------------------
+
+namespace {
+void serial_ir_learn_cb(std::string message) {
+  if (g_serial_ir_handler == nullptr) return;
+  g_serial_ir_handler->on_ir_learned(message);
+}
+}  // namespace
+
+void SerialHandler::on_ir_learned(const std::string& message) {
+  // message format: "PROTOCOL 0xHEXPAYLOAD"
+  size_t sep = message.find(' ');
+  std::string protocol = (sep != std::string::npos) ? message.substr(0, sep) : "";
+  std::string payload = (sep != std::string::npos) ? message.substr(sep + 1) : "";
+
+  std::string d = "{\"protocol\":\"" + json_escape(protocol) + "\"";
+  d += ",\"payload\":\"" + json_escape(payload) + "\"}";
+
+  // Send as unsolicited event (no request id)
+  std::string msg = "@@{\"res\":\"ir_learned\",\"ok\":true,\"data\":" + d + "}\n";
+  Serial.print(msg.c_str());
+
+  // Auto-stop after receiving a code
+  stop_ir_learning_internal();
+}
+
+void SerialHandler::stop_ir_learning_internal() {
+  if (!ir_learning_active_) return;
+  ir_learning_active_ = false;
+  set_announceNewIRmessage_cb_HAL(nullptr);
+  set_irReceiverEnabled_HAL(false);
+  shutdown_infraredReceiver_HAL();
+  if (g_serial_ir_handler == this) g_serial_ir_handler = nullptr;
+}
+
+void SerialHandler::cmd_ir_learn_start(const std::string& id) {
+  if (ir_learning_active_) {
+    send_ok("ir_learn_start", id, "{\"status\":\"already_active\"}");
+    return;
+  }
+  ir_learning_active_ = true;
+  g_serial_ir_handler = this;
+  set_announceNewIRmessage_cb_HAL(&serial_ir_learn_cb);
+  set_irReceiverEnabled_HAL(true);
+  start_infraredReceiver_HAL();
+  send_ok("ir_learn_start", id, "{\"status\":\"listening\"}");
+}
+
+void SerialHandler::cmd_ir_learn_stop(const std::string& id) {
+  stop_ir_learning_internal();
+  send_ok("ir_learn_stop", id, "{\"status\":\"stopped\"}");
 }
 
 }  // namespace omote_v2
