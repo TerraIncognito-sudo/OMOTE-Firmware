@@ -68,7 +68,7 @@ Here's how to get your first device working:
 ### Three Control Transports
 
 - **IR (Infrared)** — Control TVs, amplifiers, and any IR device. Supports all major protocols (NEC, Samsung, Sony, RC5, RC6, and many more). Built-in IR learning lets you capture codes from existing remotes.
-- **BLE Keyboard** — Control streaming devices (Fire TV, Apple TV, etc.) by emulating a Bluetooth keyboard. Supports key presses, media keys, and text input.
+- **BLE Keyboard** — Control streaming devices (Fire TV, Apple TV, etc.) by emulating a Bluetooth keyboard. Supports key presses, media keys, and text input. See the BLE command reference below for all supported actions.
 - **MQTT** — Control smart home devices over WiFi. Configure broker settings, then send topic/payload commands to any MQTT-compatible device.
 
 ### On-Device IR Learning
@@ -156,6 +156,51 @@ You can customize the button labels on the Remote tab by placing a CSV file on t
   Mute,M
   ```
 - After updating the file, go to **Settings** and tap **Reload Icon Pack**.
+
+## BLE Keyboard Command Reference
+
+BLE device commands use the format `key:<action>`, `media:<action>`, or `text:<value>`.
+
+### Key Actions (`key:`)
+
+| Payload | HID Key | Apple TV Function |
+|---------|---------|-------------------|
+| `key:up` | Up Arrow | Navigate up |
+| `key:down` | Down Arrow | Navigate down |
+| `key:left` | Left Arrow | Navigate left |
+| `key:right` | Right Arrow | Navigate right |
+| `key:ok` / `key:enter` / `key:select` / `key:return` | Return/Enter | Select/Confirm |
+| `key:back` / `key:escape` / `key:menu` | Escape | Menu / Back |
+| `key:home` | F4 | Home screen |
+| `key:space` | Spacebar | Play/Pause (alt) |
+
+### Media Actions (`media:`)
+
+| Payload | HID Consumer Key | Function |
+|---------|-----------------|----------|
+| `media:playpause` | Play/Pause | Toggle playback |
+| `media:volup` | Volume Up | Volume up |
+| `media:voldown` | Volume Down | Volume down |
+| `media:mute` | Mute | Toggle mute |
+| `media:next` | Next Track | Next track |
+| `media:prev` | Previous Track | Previous track |
+| `media:ff` | Fast Forward | Fast forward |
+| `media:ff_long` | Fast Forward (hold) | Fast forward (long press) |
+| `media:rewind` | Rewind | Rewind |
+| `media:rewind_long` | Rewind (hold) | Rewind (long press) |
+| `media:back` | AC Back | Back |
+| `media:home` | AC Home | Home |
+
+### Text Input (`text:`)
+
+| Payload | Function |
+|---------|----------|
+| `text:Hello World` | Types the string character by character |
+
+### Directed Connection
+
+Prefix any command with `address@` to connect to a specific BLE device:
+`AA:BB:CC:DD:EE:FF@key:enter`
 
 ## Serial Protocol Reference
 

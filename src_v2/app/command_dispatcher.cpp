@@ -319,10 +319,10 @@ bool CommandDispatcher::dispatch_device_command(const DeviceRecord& device, cons
       else if (ble_payload.action == "down") keyboardBLE_write_HAL(KEY_DOWN_ARROW);
       else if (ble_payload.action == "left") keyboardBLE_write_HAL(KEY_LEFT_ARROW);
       else if (ble_payload.action == "right") keyboardBLE_write_HAL(KEY_RIGHT_ARROW);
-      else if (ble_payload.action == "ok" || ble_payload.action == "enter") keyboardBLE_write_HAL(KEY_RETURN);
-      else if (ble_payload.action == "back") consumerControlBLE_write_HAL(KEY_MEDIA_WWW_BACK);
-      else if (ble_payload.action == "home") consumerControlBLE_write_HAL(KEY_MEDIA_WWW_HOME);
-      else if (ble_payload.action == "menu") keyboardBLE_write_HAL(0xED);
+      else if (ble_payload.action == "ok" || ble_payload.action == "enter" || ble_payload.action == "select" || ble_payload.action == "return") keyboardBLE_write_HAL(KEY_RETURN);
+      else if (ble_payload.action == "back" || ble_payload.action == "escape" || ble_payload.action == "menu") keyboardBLE_write_HAL(KEY_ESC);
+      else if (ble_payload.action == "home") keyboardBLE_write_HAL(KEY_F4);
+      else if (ble_payload.action == "space") keyboardBLE_write_HAL(' ');
       else {
         set_last_result(DispatchResultCode::InvalidPayload, device.id, command_name,
                         device.transport, "Invalid BLE key action");

@@ -7,27 +7,28 @@
 
 ## Overview
 
-This is the ESP32 Arduino based firmware for the OMOTE - Open Universal Remote.
+ESP32 Arduino firmware for the [OMOTE open-source universal remote](https://github.com/OMOTE-Community/OMOTE-Hardware/). Control your TV, amplifier, streaming boxes, and smart home from a single handheld device using infrared, Bluetooth, and MQTT.
 
-To run this firmware, you have two options
-*  run it on the [OMOTE ESP32 Hardware](https://github.com/OMOTE-Community/OMOTE-Hardware/)
-*  run it in the simulator on Linux, macOs or Windows
+### V2 Firmware (Recommended)
 
-### The state of this project
+The **V2 firmware** (`src_v2/`) is a complete rewrite that makes OMOTE fully configurable without touching code:
 
-The software can be adjusted to your needs. You can add your own amplifier, TV and media player. Smart home devices can be controlled with MQTT. The software is an example made up of:
-* a TV and an amplifier controlled with infrared
-* a Fire TV media player controlled with BLE (bluetooth keyboard)
-* some smart home devices controlled with MQTT
-* an IR receiver for decoding the IR codes from your remote
+- **No-code setup** — Add devices, learn IR codes, map buttons, and configure transports entirely from the touchscreen or the companion web app
+- **Three transports** — IR (all major protocols), BLE Keyboard (Apple TV, Fire TV, etc.), and MQTT (smart home)
+- **Companion web app** — Browser-based configuration tool over USB serial, with IR learning, device/activity management, and live monitoring
+- **Backup & restore** — SD card snapshots and serial export/import preserve your configuration across firmware updates
+- **On-device IR learning** — Point your existing remote at OMOTE and capture codes instantly
 
-Please see the [wiki on how to understand and modify the firmware.](https://github.com/OMOTE-Community/OMOTE-Firmware/wiki/How-to-understand-and-modify-the-firmware)
+**[Full V2 documentation](src_v2/README.md)** | Requires OMOTE Rev 5+ (ESP32-S3) and [PlatformIO](https://platformio.org/)
 
-You need to have PlatformIO running, and you need to know how to compile and flash your own firmware with PlatformIO. There is no prebuilt firmware.
+```bash
+# Build and flash V2
+pio run -e omote-v2-esp32-s3 -t upload
+```
 
-The remote can be charged and programmed via its USB-C port. Open the PlatformIO project to compile and upload the code to the ESP32.
+### V1 Firmware (Legacy)
 
-As a long term goal, maybe a prebuilt firmware will be published, where you can configure your OMOTE via a web interface.
+The original firmware in `src/` requires editing source code to add devices and commands. It supports all hardware revisions (Rev 1-5+). See the [wiki](https://github.com/OMOTE-Community/OMOTE-Firmware/wiki/How-to-understand-and-modify-the-firmware) for V1 usage.
 
 ### LVGL GUI simulator for Windows, Linux, and macOS
 
@@ -40,13 +41,11 @@ You can run the simulator in Visual Studio Code with PlatformIO. No need for any
 
 For details, please see the [wiki for the software simulator for fast creating and testing of LVGL GUIs.](https://github.com/OMOTE-Community/OMOTE-Firmware/wiki/Software-simulator-for-fast-creating-and-testing-of-LVGL-GUIs)
 
-### To-dos for software
+### Status
 
-Long term goals (not yet scheduled)
-- [ ] Add an interface for graphically editing the configuration
-- [ ] Store the configuration in Flash (e.g. as a editable json file)
+V2 has achieved the long-standing goals of graphical configuration editing and flash-based storage. Remaining work is UX polish and release hardening.
 
-See the [open issues](https://github.com/OMOTE-Community/OMOTE-Firmware/issues) and [discussions](https://github.com/OMOTE-Community/OMOTE-Firmware/discussions) for a full list of proposed features (and known issues).
+See the [open issues](https://github.com/OMOTE-Community/OMOTE-Firmware/issues) and [discussions](https://github.com/OMOTE-Community/OMOTE-Firmware/discussions) for proposed features and known issues.
 
 ## Contributing
 
